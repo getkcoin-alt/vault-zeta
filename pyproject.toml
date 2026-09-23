@@ -7,6 +7,7 @@ name = "vault-zeta"
 version = "0.1.0"
 description = "Experimental continuity layer for long-running AI systems"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = []
 
