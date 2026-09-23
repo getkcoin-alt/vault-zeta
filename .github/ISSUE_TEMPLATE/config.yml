@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: mailto:karnveer@scriza.in
+    url: https://github.com/getkcoin-alt/vault-zeta/security/policy
     about: Please report vulnerabilities privately rather than opening a public issue.
