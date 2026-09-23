@@ -131,6 +131,50 @@ At this stage it is **not**:
 
 The current alpha gives us a clean place to test continuity mechanisms before adding more intelligence around them.
 
+## JSON export and import
+
+Use `store.export_json()` to obtain a portable JSON string and
+`store.import_json(document)` to restore it into another store:
+
+```python
+from pathlib import Path
+from vault_zeta import VaultZetaStore
+
+with VaultZetaStore("original.db") as original:
+    Path("continuity.json").write_text(original.export_json(), encoding="utf-8")
+
+with VaultZetaStore("restored.db") as restored:
+    restored.import_json(Path("continuity.json").read_text(encoding="utf-8"))
+```
+
+Version 1 has exactly four top-level fields: `schema_version: 1`, `memories`,
+`events`, and `snapshots`. Records use the fields of `MemoryRecord`, `EventRecord`
+and `MissionSnapshot`, including decoded metadata/payload/snapshot objects.
+Export sorts object keys and orders memories by ID, events by global sequence
+number, and snapshots by mission ID. UTF-8 JSON uses compact separators and a
+trailing newline; an unchanged store produces the same string. Export reads a
+consistent SQLite snapshot.
+
+Import preserves IDs, provenance, source fingerprints, confidence, stale state,
+timestamps, event sequence numbers and each current snapshot's revision. It also
+rebuilds search entries for imported memories. The store does not retain older
+snapshot versions, so export cannot supply historical revisions that are absent.
+
+Duplicate memory IDs, event sequence numbers or mission snapshot IDs are errors,
+both within an input and against the destination. Import never overwrites or
+renumbers records. A collision rolls back the entire import, including search
+entries; unsupported versions or malformed records raise `ValueError` before
+any insertion. Existing caller transactions are not committed by either helper.
+Use a fresh store when restoring a complete export, especially because event
+sequence numbers are global rather than scoped to a mission.
+
+The helpers return/accept strings and do not open referenced sources, write
+export files, or add the database path or other local filesystem paths. Existing
+source strings and metadata are preserved exactly, including any private data
+the caller previously stored: inspect an export before sharing it. The complete
+document is held in memory; this is a local transfer format, not a streaming
+backup, encryption layer or authorization mechanism.
+
 ## Where this is going
 
 The next useful steps are:
@@ -139,7 +183,6 @@ The next useful steps are:
 - entity links and relationship history
 - resumable task-graph primitives
 - correction/supersession semantics
-- import/export with provenance preserved
 - retrieval evaluation instead of “memory feels good”
 - encryption options for sensitive local stores
 - adapters for Scrappy Forge and CANOPY
