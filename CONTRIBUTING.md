@@ -51,4 +51,4 @@ If a change makes stored history automatically grant permission to execute somet
 
 ## Licensing
 
-The repository is public while the project license is being selected. Public visibility by itself does not grant reuse rights. Please keep contributions small until the license is explicitly added.
+Vault Zeta is licensed under the [Apache License 2.0](LICENSE). By submitting a contribution for inclusion in the project, you agree that it can be distributed under that license.
