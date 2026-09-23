@@ -151,3 +151,8 @@ Please do not submit real private memories, credentials, customer data or person
 ---
 
 Built around a simple belief: **intelligence without continuity keeps relearning the same life.**
+
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
