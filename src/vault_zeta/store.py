@@ -330,6 +330,18 @@ class VaultZetaStore:
     def close(self) -> None:
         self.db.close()
 
+    def export_json(self) -> str:
+        """Export all records as deterministic versioned JSON, preserving provenance."""
+        from .transfer import export_json
+
+        return export_json(self)
+
+    def import_json(self, document: str) -> None:
+        """Import version 1 JSON atomically; reject duplicate IDs instead of overwriting."""
+        from .transfer import import_json
+
+        import_json(self, document)
+
     def __enter__(self) -> "VaultZetaStore":
         return self
 
