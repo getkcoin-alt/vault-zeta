@@ -10,6 +10,19 @@ Not “infinite memory”. Not a magic brain dump. The goal is much more practic
 
 I sometimes call it **the daddy of the future** 😅🌠. The repository is where that joke has to survive contact with code.
 
+```mermaid
+flowchart LR
+    A[Agent / application] --> Z[Vault Zeta]
+    Z --> M[Memory + provenance]
+    Z --> E[Append-only events]
+    Z --> S[Mission snapshot]
+    M --> DB[(SQLite)]
+    E --> DB
+    S --> DB
+```
+
+The storage is intentionally boring right now. I want the continuity model to be understandable before making it distributed, embedded, or clever.
+
 ## What exists today
 
 The first public alpha is deliberately small. It includes:
