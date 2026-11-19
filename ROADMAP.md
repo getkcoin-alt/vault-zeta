@@ -22,14 +22,24 @@ This is a direction, not a release promise.
 - import/export bundle format v1.1.0 with provenance, entities, and lineages preserved
 - MCP tools for supersession, lineage, explainable search, and entity navigation
 
-## 0.3 — long-running work & mission continuity (next)
+## 0.3 — long-running work & mission continuity (completed)
 
-- task graph primitives and dependency tracking
-- pause/resume/correction event helpers
-- recovery tests across process restarts
-- deterministic event replay harnesses
-- retention and compaction policies
+- directed acyclic task graph (DAG) primitives with cycle detection (`mission_tasks`, `mission_task_deps`)
+- cascade unblocking of downstream dependent tasks
+- crash recovery and resumption plan builder (`recover_mission`, `mission_resumption_plan`)
+- deterministic event replay verification (`replay_events`, `mission_replay_events`)
+- event deduplication via `idempotency_key`
+- mission state compaction (`compact_mission`)
+- bundle protocol v1.2.0 supporting portable task graphs
+- MCP tools for task management, recovery, and replay
+
+## 0.4 — multi-agent continuity & external integrations (next)
+
+- independent agent identities and scoped memory namespaces (`agent_id`, `actor`, `workspace`)
+- cross-agent handoffs with explicit provenance tracking
 - Scrappy Forge and CANOPY adapters
+- shared versus private memory semantics
+- retention and compaction lifecycle policies
 
 ## Later
 

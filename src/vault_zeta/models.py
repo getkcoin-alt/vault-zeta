@@ -57,6 +57,7 @@ class EventRecord:
     event_type: str
     payload: dict[str, Any]
     created_at: str
+    idempotency_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,3 +67,31 @@ class MissionSnapshot:
     snapshot: dict[str, Any]
     revision: int
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRecord:
+    mission_id: str
+    task_id: str
+    title: str
+    description: str
+    status: str  # pending, running, completed, failed, skipped, blocked
+    dependencies: list[str]
+    payload: dict[str, Any]
+    result: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResumptionPlan:
+    mission_id: str
+    status: str
+    revision: int
+    last_event_seq: int
+    completed_task_ids: list[str]
+    ready_task_ids: list[str]
+    blocked_task_ids: list[str]
+    failed_task_ids: list[str]
+    in_progress_recovered_task_ids: list[str]
+    snapshot: dict[str, Any] | None

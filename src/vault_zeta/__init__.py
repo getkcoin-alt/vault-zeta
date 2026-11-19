@@ -8,7 +8,9 @@ from .models import (
     MemoryEntityLink,
     MemoryRecord,
     MissionSnapshot,
+    ResumptionPlan,
     SearchScoreBreakdown,
+    TaskRecord,
 )
 from .redact import SecretInVault, assert_clean, assert_clean_structure
 from .store import RevisionConflict, VaultZetaStore
@@ -19,12 +21,14 @@ __all__ = [
     "MemoryEntityLink",
     "MemoryRecord",
     "MissionSnapshot",
+    "ResumptionPlan",
     "RetrievalEvalCase",
     "RetrievalEvalResult",
     "RetrievalEvalSummary",
     "RevisionConflict",
     "SearchScoreBreakdown",
     "SecretInVault",
+    "TaskRecord",
     "VaultZetaStore",
     "assert_clean",
     "assert_clean_structure",
@@ -34,4 +38,4 @@ __all__ = [
     "record_hash",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"

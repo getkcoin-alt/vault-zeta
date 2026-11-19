@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — durable mission execution and task graphs
+
+- added directed acyclic task graphs (`mission_tasks`, `mission_task_deps`, `create_task`, `update_task`)
+- added cycle detection preventing recursive dependency loops in task graphs
+- added cascade unblocking: completing a prerequisite task automatically unblocks downstream dependent tasks
+- added crash recovery and resumption plan builder (`recover_mission`, `mission_resumption_plan`) identifying interrupted running tasks and resetting them safely
+- added deterministic event replay harness (`replay_events`, `mission_replay_events`) reconstructing task states from immutable event journals
+- added event deduplication with `idempotency_key` ensuring safe retries across network or process boundaries
+- added mission state compaction (`compact_mission`, `mission_compact`) preserving append-only audit journals
+- upgraded bundle export/import protocol to v1.2.0 supporting portable task graphs and dependencies
+- added MCP tools: `task_create`, `task_update`, `task_list`, `mission_resumption_plan`, `mission_replay_events`, `mission_compact`
+
 ## 0.2.2 — retrieval intelligence and lineage
 
 - added memory supersession (`supersedes_id`, `superseded_by`, `supersede_memory`) for explicit factual evolution

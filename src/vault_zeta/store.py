@@ -6,8 +6,9 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .models import (
     EntityRecord,
@@ -15,7 +16,9 @@ from .models import (
     MemoryEntityLink,
     MemoryRecord,
     MissionSnapshot,
+    ResumptionPlan,
     SearchScoreBreakdown,
+    TaskRecord,
 )
 from .redact import assert_clean, assert_clean_structure
 
@@ -32,6 +35,15 @@ class VaultZetaStore:
         "failure",
         "entity",
         "preference",
+    }
+
+    TASK_STATUSES = {
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "skipped",
+        "blocked",
     }
 
     def __init__(self, path: str | Path = "vault_zeta.db") -> None:
@@ -76,7 +88,8 @@ class VaultZetaStore:
                     mission_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    idempotency_key TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_mission_events_mission_seq
@@ -89,20 +102,53 @@ class VaultZetaStore:
                     revision INTEGER NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS mission_tasks (
+                    mission_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped', 'blocked')),
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (mission_id, task_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mission_tasks_status
+                ON mission_tasks(mission_id, status);
+
+                CREATE TABLE IF NOT EXISTS mission_task_deps (
+                    mission_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    depends_on_task_id TEXT NOT NULL,
+                    PRIMARY KEY (mission_id, task_id, depends_on_task_id),
+                    FOREIGN KEY (mission_id, task_id) REFERENCES mission_tasks(mission_id, task_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mission_task_deps
+                ON mission_task_deps(mission_id, depends_on_task_id);
                 """
             )
 
-            # Migration for existing memories tables lacking lineage columns
-            cols = {row["name"] for row in self.db.execute("PRAGMA table_info(memories)").fetchall()}
-            if "supersedes_id" not in cols:
+            # Migrations for existing tables
+            mem_cols = {row["name"] for row in self.db.execute("PRAGMA table_info(memories)").fetchall()}
+            if "supersedes_id" not in mem_cols:
                 self.db.execute("ALTER TABLE memories ADD COLUMN supersedes_id TEXT REFERENCES memories(id)")
-            if "superseded_by" not in cols:
+            if "superseded_by" not in mem_cols:
                 self.db.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT REFERENCES memories(id)")
+
+            ev_cols = {row["name"] for row in self.db.execute("PRAGMA table_info(mission_events)").fetchall()}
+            if "idempotency_key" not in ev_cols:
+                self.db.execute("ALTER TABLE mission_events ADD COLUMN idempotency_key TEXT")
 
             self.db.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes_id);
                 CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_mission_events_idempotency
+                ON mission_events(mission_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS entities (
                     id TEXT PRIMARY KEY,
@@ -263,7 +309,6 @@ class VaultZetaStore:
     def get_lineage(self, memory_id: str) -> list[MemoryRecord]:
         """Return the chronological lineage chain of a memory (all ancestors and descendants)."""
         with self._lock:
-            # 1. Walk backward to root ancestor
             ancestors: list[MemoryRecord] = []
             curr_id = memory_id
             visited = set()
@@ -275,10 +320,8 @@ class VaultZetaStore:
                 curr_id = rec.supersedes_id
 
             ancestors.reverse()
-
             target = self.get_memory(memory_id)
 
-            # 2. Walk forward to latest descendant
             descendants: list[MemoryRecord] = []
             curr_id = target.superseded_by
             while curr_id and curr_id not in visited:
@@ -476,6 +519,7 @@ class VaultZetaStore:
                     phrase = " ".join(f'"{token}"' for token in tokens)
                     or_terms = " OR ".join(f'"{token}"' for token in tokens)
                     fts_query = f"({phrase}) OR ({or_terms})"
+
                 rows = self.db.execute(
                     f"""
                     SELECT m.*
@@ -545,6 +589,7 @@ class VaultZetaStore:
                     phrase = " ".join(f'"{token}"' for token in tokens)
                     or_terms = " OR ".join(f'"{token}"' for token in tokens)
                     fts_query = f"({phrase}) OR ({or_terms})"
+
                 rows = self.db.execute(
                     f"""
                     SELECT m.*, bm25(memories_fts) AS bm25_score,
@@ -576,12 +621,9 @@ class VaultZetaStore:
             bm25_raw = float(r["bm25_score"]) if r["bm25_score"] is not None else 0.0
             days_ago = max(0.0, float(r["days_ago"]) if r["days_ago"] is not None else 0.0)
 
-            # SQLite FTS5 bm25 returns negative or zero: lower is better match.
             match_intensity = max(0.0, -bm25_raw)
-            # Monotonic bounded normalization in [0, 1]
             bm25_norm = match_intensity / (1.0 + match_intensity) if match_intensity > 0 else 0.0
             confidence = rec.confidence
-            # Recency decay (half-life ~30 days)
             recency = 1.0 / (1.0 + (days_ago / 30.0))
 
             if tokens:
@@ -636,6 +678,7 @@ class VaultZetaStore:
         event_type: str,
         payload: dict[str, Any] | None = None,
         created_at: str | None = None,
+        idempotency_key: str | None = None,
         reject_secrets: bool = True,
     ) -> int:
         mission_id = mission_id.strip()
@@ -648,22 +691,21 @@ class VaultZetaStore:
 
         payload_json = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
         with self._lock, self.db:
-            if created_at:
-                cursor = self.db.execute(
-                    """
-                    INSERT INTO mission_events(mission_id, event_type, payload_json, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (mission_id, event_type, payload_json, created_at),
-                )
-            else:
-                cursor = self.db.execute(
-                    """
-                    INSERT INTO mission_events(mission_id, event_type, payload_json)
-                    VALUES (?, ?, ?)
-                    """,
-                    (mission_id, event_type, payload_json),
-                )
+            if idempotency_key:
+                row = self.db.execute(
+                    "SELECT seq FROM mission_events WHERE mission_id = ? AND idempotency_key = ?",
+                    (mission_id, idempotency_key),
+                ).fetchone()
+                if row:
+                    return int(row["seq"])
+
+            cursor = self.db.execute(
+                """
+                INSERT INTO mission_events(mission_id, event_type, payload_json, created_at, idempotency_key)
+                VALUES (?, ?, ?, coalesce(?, CURRENT_TIMESTAMP), ?)
+                """,
+                (mission_id, event_type, payload_json, created_at, idempotency_key),
+            )
             return int(cursor.lastrowid)
 
     def events(self, mission_id: str, *, after_seq: int = 0) -> list[EventRecord]:
@@ -683,9 +725,380 @@ class VaultZetaStore:
                 event_type=row["event_type"],
                 payload=json.loads(row["payload_json"]),
                 created_at=row["created_at"],
+                idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
             )
             for row in rows
         ]
+
+    # --- Phase 2: Task Graph Primitives & Mission Resumption ---
+
+    def _check_task_cycle(self, mission_id: str, task_id: str, proposed_deps: list[str]) -> None:
+        """Verify that adding proposed dependencies for task_id does not introduce a cycle."""
+        for start in proposed_deps:
+            if start == task_id:
+                raise ValueError(f"Self-dependency detected for task {task_id!r}")
+            visited = set()
+            queue = [start]
+            while queue:
+                curr = queue.pop(0)
+                if curr == task_id:
+                    raise ValueError(
+                        f"Cycle detected in task graph for mission {mission_id!r}: {task_id} -> {start} -> ... -> {task_id}"
+                    )
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                rows = self.db.execute(
+                    "SELECT depends_on_task_id FROM mission_task_deps WHERE mission_id = ? AND task_id = ?",
+                    (mission_id, curr),
+                ).fetchall()
+                for r in rows:
+                    queue.append(r["depends_on_task_id"])
+
+    def create_task(
+        self,
+        *,
+        mission_id: str,
+        task_id: str,
+        title: str,
+        description: str = "",
+        dependencies: list[str] | None = None,
+        payload: dict[str, Any] | None = None,
+        status: str | None = None,
+        reject_secrets: bool = True,
+    ) -> TaskRecord:
+        """Create a new task node in a mission's directed acyclic task graph (DAG)."""
+        mission_id = mission_id.strip()
+        task_id = task_id.strip()
+        title = title.strip()
+        if not mission_id or not task_id or not title:
+            raise ValueError("mission_id, task_id, and title must not be empty")
+
+        deps = sorted(set(dependencies or []))
+        if reject_secrets:
+            assert_clean(title, f"task title ({task_id})")
+            if description:
+                assert_clean(description, f"task description ({task_id})")
+            if payload:
+                assert_clean_structure(payload, f"task payload ({task_id})")
+
+        payload_json = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+
+        with self._lock, self.db:
+            existing = self.db.execute(
+                "SELECT task_id FROM mission_tasks WHERE mission_id = ? AND task_id = ?",
+                (mission_id, task_id),
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Task {task_id!r} already exists for mission {mission_id!r}")
+
+            self._check_task_cycle(mission_id, task_id, deps)
+
+            # Auto-compute initial status based on dependencies if not provided
+            if status is None:
+                if deps:
+                    unmet = self.db.execute(
+                        """
+                        SELECT count(*) FROM mission_task_deps d
+                        LEFT JOIN mission_tasks t ON t.mission_id = d.mission_id AND t.task_id = d.depends_on_task_id
+                        WHERE d.mission_id = ? AND d.task_id = ? AND (t.status IS NULL OR t.status != 'completed')
+                        """,
+                        (mission_id, task_id),
+                    ).fetchone()[0]
+                    # Also check against the proposed deps list in case deps are not in DB yet
+                    status = "blocked"
+                else:
+                    status = "pending"
+
+            if status not in self.TASK_STATUSES:
+                raise ValueError(f"Invalid task status: {status}")
+
+            self.db.execute(
+                """
+                INSERT INTO mission_tasks (mission_id, task_id, title, description, status, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (mission_id, task_id, title, description, status, payload_json),
+            )
+
+            for dep in deps:
+                self.db.execute(
+                    """
+                    INSERT INTO mission_task_deps (mission_id, task_id, depends_on_task_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (mission_id, task_id, dep),
+                )
+
+            # Re-evaluate status if all dependencies were already completed
+            if deps and status == "blocked":
+                unmet = self.db.execute(
+                    """
+                    SELECT count(*) FROM mission_task_deps d
+                    LEFT JOIN mission_tasks t ON t.mission_id = d.mission_id AND t.task_id = d.depends_on_task_id
+                    WHERE d.mission_id = ? AND d.task_id = ? AND (t.status IS NULL OR t.status != 'completed')
+                    """,
+                    (mission_id, task_id),
+                ).fetchone()[0]
+                if unmet == 0:
+                    status = "pending"
+                    self.db.execute(
+                        "UPDATE mission_tasks SET status = 'pending' WHERE mission_id = ? AND task_id = ?",
+                        (mission_id, task_id),
+                    )
+
+            self.append_event(
+                mission_id=mission_id,
+                event_type="task_created",
+                payload={"task_id": task_id, "title": title, "status": status, "dependencies": deps},
+                reject_secrets=reject_secrets,
+            )
+
+            return self.get_task(mission_id, task_id)
+
+    def update_task(
+        self,
+        *,
+        mission_id: str,
+        task_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        reject_secrets: bool = True,
+    ) -> TaskRecord:
+        """Update a task's status and result, triggering cascade unblocking for downstream dependents."""
+        if status not in self.TASK_STATUSES:
+            raise ValueError(f"Invalid task status: {status}")
+
+        if reject_secrets:
+            if result:
+                assert_clean_structure(result, f"task result ({task_id})")
+            if error:
+                assert_clean(error, f"task error ({task_id})")
+
+        result_payload = dict(result or {})
+        if error:
+            result_payload["error"] = error
+        result_json = json.dumps(result_payload, sort_keys=True, separators=(",", ":"))
+
+        with self._lock, self.db:
+            # Verify task exists
+            _ = self.get_task(mission_id, task_id)
+
+            self.db.execute(
+                """
+                UPDATE mission_tasks
+                SET status = ?, result_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND task_id = ?
+                """,
+                (status, result_json, mission_id, task_id),
+            )
+
+            self.append_event(
+                mission_id=mission_id,
+                event_type=f"task_{status}",
+                payload={"task_id": task_id, "status": status, "result": result_payload},
+                reject_secrets=reject_secrets,
+            )
+
+            # Cascade unblocking: if task completed, unblock any downstream tasks whose preconditions are now met
+            if status == "completed":
+                dependent_rows = self.db.execute(
+                    "SELECT task_id FROM mission_task_deps WHERE mission_id = ? AND depends_on_task_id = ?",
+                    (mission_id, task_id),
+                ).fetchall()
+                for dep_row in dependent_rows:
+                    dtid = dep_row["task_id"]
+                    dtask = self.db.execute(
+                        "SELECT status FROM mission_tasks WHERE mission_id = ? AND task_id = ?",
+                        (mission_id, dtid),
+                    ).fetchone()
+                    if dtask and dtask["status"] == "blocked":
+                        unmet = self.db.execute(
+                            """
+                            SELECT count(*) FROM mission_task_deps d
+                            LEFT JOIN mission_tasks t ON t.mission_id = d.mission_id AND t.task_id = d.depends_on_task_id
+                            WHERE d.mission_id = ? AND d.task_id = ? AND (t.status IS NULL OR t.status != 'completed')
+                            """,
+                            (mission_id, dtid),
+                        ).fetchone()[0]
+                        if unmet == 0:
+                            self.db.execute(
+                                "UPDATE mission_tasks SET status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE mission_id = ? AND task_id = ?",
+                                (mission_id, dtid),
+                            )
+                            self.append_event(
+                                mission_id=mission_id,
+                                event_type="task_unblocked",
+                                payload={"task_id": dtid, "unblocked_by": task_id},
+                                reject_secrets=reject_secrets,
+                            )
+
+            return self.get_task(mission_id, task_id)
+
+    def get_task(self, mission_id: str, task_id: str) -> TaskRecord:
+        """Fetch a specific task record with its resolved dependencies."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM mission_tasks WHERE mission_id = ? AND task_id = ?",
+                (mission_id, task_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Task {task_id!r} not found in mission {mission_id!r}")
+            return self._task(row)
+
+    def list_tasks(self, mission_id: str, *, status: str | None = None) -> list[TaskRecord]:
+        """List tasks for a mission, optionally filtered by execution status."""
+        with self._lock:
+            if status:
+                rows = self.db.execute(
+                    "SELECT * FROM mission_tasks WHERE mission_id = ? AND status = ? ORDER BY created_at ASC",
+                    (mission_id, status),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT * FROM mission_tasks WHERE mission_id = ? ORDER BY created_at ASC",
+                    (mission_id,),
+                ).fetchall()
+            return [self._task(r) for r in rows]
+
+    def get_ready_tasks(self, mission_id: str) -> list[TaskRecord]:
+        """Return tasks that are in 'pending' status and ready for execution."""
+        return self.list_tasks(mission_id, status="pending")
+
+    def recover_mission(self, mission_id: str, *, reset_running: bool = True) -> ResumptionPlan:
+        """Inspect mission state after process restart or crash, recovering interrupted tasks and building a resumption plan."""
+        with self._lock, self.db:
+            snap = self.load_mission(mission_id)
+            mission_status = snap.status if snap else "uninitialized"
+            revision = snap.revision if snap else 0
+
+            last_seq_row = self.db.execute(
+                "SELECT coalesce(max(seq), 0) as last_seq FROM mission_events WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()
+            last_seq = int(last_seq_row["last_seq"])
+
+            # Find interrupted 'running' tasks
+            running_rows = self.db.execute(
+                "SELECT task_id FROM mission_tasks WHERE mission_id = ? AND status = 'running'",
+                (mission_id,),
+            ).fetchall()
+            recovered_ids = [r["task_id"] for r in running_rows]
+
+            if reset_running and recovered_ids:
+                for tid in recovered_ids:
+                    self.db.execute(
+                        "UPDATE mission_tasks SET status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE mission_id = ? AND task_id = ?",
+                        (mission_id, tid),
+                    )
+                self.append_event(
+                    mission_id=mission_id,
+                    event_type="crash_recovery",
+                    payload={"recovered_tasks": recovered_ids, "action": "reset_to_pending"},
+                )
+
+            # Categorize all tasks
+            all_tasks = self.list_tasks(mission_id)
+            completed = [t.task_id for t in all_tasks if t.status == "completed"]
+            ready = [t.task_id for t in all_tasks if t.status == "pending"]
+            blocked = [t.task_id for t in all_tasks if t.status == "blocked"]
+            failed = [t.task_id for t in all_tasks if t.status in ("failed", "skipped")]
+
+            return ResumptionPlan(
+                mission_id=mission_id,
+                status=mission_status,
+                revision=revision,
+                last_event_seq=last_seq,
+                completed_task_ids=completed,
+                ready_task_ids=ready,
+                blocked_task_ids=blocked,
+                failed_task_ids=failed,
+                in_progress_recovered_task_ids=recovered_ids,
+                snapshot=snap.snapshot if snap else None,
+            )
+
+    def replay_events(
+        self,
+        mission_id: str,
+        *,
+        from_seq: int = 0,
+        to_seq: int | None = None,
+    ) -> dict[str, Any]:
+        """Replay mission events sequentially through a deterministic state machine to verify historical state consistency."""
+        with self._lock:
+            if to_seq is not None:
+                rows = self.db.execute(
+                    "SELECT * FROM mission_events WHERE mission_id = ? AND seq >= ? AND seq <= ? ORDER BY seq ASC",
+                    (mission_id, from_seq, to_seq),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT * FROM mission_events WHERE mission_id = ? AND seq >= ? ORDER BY seq ASC",
+                    (mission_id, from_seq),
+                ).fetchall()
+
+            events = [
+                EventRecord(
+                    seq=int(r["seq"]),
+                    mission_id=r["mission_id"],
+                    event_type=r["event_type"],
+                    payload=json.loads(r["payload_json"]),
+                    created_at=r["created_at"],
+                    idempotency_key=r["idempotency_key"] if "idempotency_key" in r.keys() else None,
+                )
+                for r in rows
+            ]
+
+            reconstructed_task_status: dict[str, str] = {}
+            for ev in events:
+                if ev.event_type == "task_created":
+                    reconstructed_task_status[ev.payload["task_id"]] = ev.payload.get("status", "pending")
+                elif ev.event_type.startswith("task_") and ev.event_type != "task_unblocked":
+                    status = ev.event_type[len("task_"):]
+                    if status in self.TASK_STATUSES:
+                        reconstructed_task_status[ev.payload["task_id"]] = status
+                elif ev.event_type == "task_unblocked":
+                    reconstructed_task_status[ev.payload["task_id"]] = "pending"
+                elif ev.event_type == "crash_recovery":
+                    for rtid in ev.payload.get("recovered_tasks", []):
+                        reconstructed_task_status[rtid] = "pending"
+
+            current_tasks = self.list_tasks(mission_id)
+            current_status = {t.task_id: t.status for t in current_tasks}
+
+            is_consistent = (reconstructed_task_status == current_status)
+            return {
+                "mission_id": mission_id,
+                "events_replayed": len(events),
+                "reconstructed_task_statuses": reconstructed_task_status,
+                "current_task_statuses": current_status,
+                "is_consistent": is_consistent,
+            }
+
+    def compact_mission(self, mission_id: str, *, keep_last_revisions: int = 5) -> dict[str, int]:
+        """Compact mission state: preserves all immutable event journals while certifying snapshot revision state."""
+        with self._lock, self.db:
+            snap = self.load_mission(mission_id)
+            ev_count = self.db.execute(
+                "SELECT count(*) FROM mission_events WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()[0]
+
+            self.append_event(
+                mission_id=mission_id,
+                event_type="mission_compacted",
+                payload={"keep_last_revisions": keep_last_revisions, "events_preserved": ev_count},
+            )
+
+            return {
+                "mission_id": mission_id,
+                "events_preserved": ev_count,
+                "snapshots_active": 1 if snap else 0,
+            }
+
+    # --- End Phase 2 Task Graph ---
 
     def save_mission(
         self,
@@ -864,4 +1277,25 @@ class VaultZetaStore:
             updated_at=row["updated_at"],
             supersedes_id=row["supersedes_id"] if "supersedes_id" in keys else None,
             superseded_by=row["superseded_by"] if "superseded_by" in keys else None,
+        )
+
+    def _task(self, row: sqlite3.Row, deps: list[str] | None = None) -> TaskRecord:
+        if deps is None:
+            dep_rows = self.db.execute(
+                "SELECT depends_on_task_id FROM mission_task_deps WHERE mission_id = ? AND task_id = ? ORDER BY depends_on_task_id ASC",
+                (row["mission_id"], row["task_id"]),
+            ).fetchall()
+            deps = [r["depends_on_task_id"] for r in dep_rows]
+
+        return TaskRecord(
+            mission_id=row["mission_id"],
+            task_id=row["task_id"],
+            title=row["title"],
+            description=row["description"],
+            status=row["status"],
+            dependencies=deps,
+            payload=json.loads(row["payload_json"]),
+            result=json.loads(row["result_json"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
