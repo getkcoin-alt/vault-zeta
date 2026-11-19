@@ -104,3 +104,24 @@ def test_mission_snapshots_use_optimistic_revisions(store):
 def test_invalid_memory_kind_is_rejected(store):
     with pytest.raises(ValueError):
         store.add_memory(kind="telepathy", content="Nope")
+
+
+def test_secrets_rejected_by_default(store):
+    with pytest.raises(ValueError, match="Refusing to save: detected what looks like a openai-style key"):
+        store.add_memory(
+            kind="semantic",
+            content="Use key sk-1234567890abcdef12345678 for access",
+        )
+
+
+def test_context_pack(store):
+    store.add_memory(
+        kind="procedural",
+        content="Always check oil temperature before turning on turbine.",
+        scope="turbine/station",
+    )
+    packed = store.context_pack("turbine", scope="turbine/station")
+    assert packed["count"] == 1
+    assert "VAULT_ZETA_MEMORY_CONTEXT" in packed["context"]
+    assert "<vault_memories>" in packed["context"]
+    assert "Always check oil temperature" in packed["context"]

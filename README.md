@@ -25,17 +25,21 @@ The storage is intentionally boring right now. I want the continuity model to be
 
 ## What exists today
 
-The first public alpha is deliberately small. It includes:
+The public release includes:
 
 - SQLite-backed durable memory
-- memory kinds such as episodic, semantic, procedural, failure, entity and preference
-- scope, provenance and confidence on memory records
-- source fingerprints and stale-memory marking
-- lexical retrieval with SQLite FTS5
-- an append-only mission event journal
-- durable mission snapshots with optimistic revision checks
+- Model Context Protocol (MCP) server for OpenCode, Claude Code, Cursor, and any MCP-compatible agent
+- Memory kinds such as episodic, semantic, procedural, failure, entity and preference
+- Scope, provenance and confidence on memory records
+- Source fingerprints and stale-memory marking
+- Lexical retrieval with SQLite FTS5
+- Untrusted data boundary context packaging (`context_pack`) to prevent memory-based prompt injections
+- Automatic secret and credential leak detection (`redact.py`) on memory writes
+- Portable directory bundle export (`bundle_export`) and deduplicated import (`bundle_import`)
+- Append-only mission event journal
+- Durable mission snapshots with optimistic revision checks
 - JSON metadata instead of hidden in-memory state
-- tests for the core persistence and continuity behavior
+- Comprehensive test suite for persistence, continuity, redaction, and MCP behavior
 
 The important rule is:
 
@@ -116,6 +120,60 @@ A mission has an append-only event stream plus a replaceable snapshot. The event
 That is a feature.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the current boundaries.
+
+## Model Context Protocol (MCP) Server
+
+Vault Zeta can be mounted as an MCP server in any modern coding agent (OpenCode, Claude Code, Cursor, Antigravity).
+
+Many agents come and go — our memory lasts forever.
+
+### Run locally:
+
+```bash
+uv run --python 3.12 -m vault_zeta.mcp_server
+```
+
+Or configure in `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "vault-zeta": {
+      "enabled": true,
+      "type": "local",
+      "command": [
+        "uv",
+        "run",
+        "--python",
+        "3.12",
+        "--with",
+        "mcp>=1.0",
+        "--directory",
+        "/Users/karnveersingh/vault-zeta",
+        "-m",
+        "vault_zeta.mcp_server"
+      ]
+    }
+  }
+}
+```
+
+### Available MCP Tools:
+
+| Tool | Purpose |
+|---|---|
+| `memory_save` | Persist a durable fact with kind, scope, source, and confidence. Rejects secrets automatically. |
+| `memory_search` | FTS5 lexical search across stored memories with optional scope/kind filters. |
+| `context_pack` | Return recalled facts formatted safely within `<vault_memories>` prompt injection boundaries. |
+| `memory_list` | Browse recent memories newest-first. |
+| `memory_delete` | Remove a memory by UUID. |
+| `vault_status` | Health, DB location, memory counts, and mission stats. |
+| `event_append` | Append an observation, tool result, or step to a mission's append-only journal. |
+| `event_list` | Read ordered mission events. |
+| `mission_save` | Save/update a mission snapshot with optimistic revision concurrency. |
+| `mission_load` | Load a mission snapshot to resume execution. |
+| `bundle_export` | Export vault into a portable directory bundle. |
+| `bundle_import` | Import and deduplicate a portable bundle directory. |
 
 ## What Vault Zeta is not
 

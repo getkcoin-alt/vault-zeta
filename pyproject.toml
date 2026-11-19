@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vault-zeta"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental continuity layer for long-running AI systems"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -12,7 +12,11 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24", "ruff>=0.12,<1", "mcp>=1.0"]
+
+[project.scripts]
+vault-zeta-mcp = "vault_zeta.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
