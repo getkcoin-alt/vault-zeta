@@ -12,8 +12,9 @@ never contaminate long-term memory.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Final
+from typing import Any, Final
 
 SECRET_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("openai-style key", re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b")),
@@ -66,6 +67,32 @@ def assert_clean(text: str, where: str = "memory") -> None:
     kind = find_secret(text)
     if kind is not None:
         raise SecretInVault(kind, where)
+
+
+def assert_clean_structure(data: Any, where: str = "data") -> None:
+    """Recursively scan strings, dicts, lists, and primitives for credential shapes."""
+    if data is None:
+        return
+    if isinstance(data, str):
+        assert_clean(data, where)
+    elif isinstance(data, (dict, list, tuple, set)):
+        # First quick serialized check
+        try:
+            serialized = json.dumps(data, default=str)
+            assert_clean(serialized, where)
+        except SecretInVault:
+            raise
+        except Exception:
+            pass
+        # Deep item check for detailed path reporting
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str):
+                    assert_clean(k, f"{where}.key({k})")
+                assert_clean_structure(v, f"{where}[{k}]")
+        elif isinstance(data, (list, tuple, set)):
+            for i, item in enumerate(data):
+                assert_clean_structure(item, f"{where}[{i}]")
 
 
 def mask(text: str) -> str:

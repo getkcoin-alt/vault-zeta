@@ -9,6 +9,7 @@ Agents come and go — memory stays.
 Tools:
   memory_save         Persist a durable fact with provenance and confidence.
   memory_search       FTS5 lexical search over stored memories.
+  memory_mark_stale   Mark memories stale when their source changes.
   context_pack        Model-ready context formatted safely inside <vault_memories>.
   memory_list         Browse recent memories (newest first).
   memory_delete       Remove a memory by ID.
@@ -85,6 +86,7 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
             "Vault Zeta provides sovereign, persistent long-term memory and mission continuity. "
             "Use memory_save to persist durable facts, user preferences, instructions, and insights. "
             "Use memory_search or context_pack to recall past context. "
+            "Use memory_mark_stale to invalidate memories when sources change. "
             "Never store credentials or API keys in memory."
         ),
     )
@@ -97,6 +99,7 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
         scope: str = "global",
         source: str | None = None,
         confidence: float = 0.9,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Save a durable fact or insight to Vault Zeta's long-term memory.
 
@@ -112,6 +115,7 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
                 scope=scope,
                 source=source,
                 confidence=float(confidence),
+                metadata=metadata,
             )
             return _fmt({"saved": True, **_memory_dict(mem)})
         except SecretInVault as e:
@@ -143,6 +147,22 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
                 "count": len(hits),
                 "memories": [_memory_dict(h) for h in hits],
             })
+        except Exception as e:
+            return _fmt({"error": str(e)})
+
+    @server.tool()
+    def memory_mark_stale(
+        source: str,
+        current_fingerprint: str,
+    ) -> str:
+        """Mark stored memories stale when their source file or document has changed.
+
+        Any memories pointing to this source whose stored fingerprint differs from
+        current_fingerprint will be marked stale=1 and excluded from standard search.
+        """
+        try:
+            count = store.mark_source_stale(source, current_fingerprint=current_fingerprint)
+            return _fmt({"marked_stale": count, "source": source, "current_fingerprint": current_fingerprint})
         except Exception as e:
             return _fmt({"error": str(e)})
 
@@ -216,7 +236,7 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
             events = store.db.execute("SELECT count(*) FROM mission_events").fetchone()[0]
             return _fmt({
                 "vault": "Vault Zeta",
-                "version": "0.2.0",
+                "version": "0.2.1",
                 "db_path": str(store.path),
                 "memories": total,
                 "by_kind": {r["kind"]: r["cnt"] for r in by_kind},
@@ -243,6 +263,8 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
                 payload=payload,
             )
             return _fmt({"appended": True, "seq": seq, "mission_id": mission_id})
+        except SecretInVault as e:
+            return _fmt({"appended": False, "error": "secret_rejected", "message": str(e)})
         except Exception as e:
             return _fmt({"appended": False, "error": str(e)})
 
@@ -286,6 +308,8 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
                 expected_revision=expected_revision,
             )
             return _fmt({"saved": True, "mission_id": mission_id, "revision": rev})
+        except SecretInVault as e:
+            return _fmt({"saved": False, "error": "secret_rejected", "message": str(e)})
         except Exception as e:
             return _fmt({"saved": False, "error": str(e)})
 
@@ -313,6 +337,8 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
         try:
             out_path = store.export_bundle(output_dir, vault_id=vault_id)
             return _fmt({"exported": True, "directory": str(out_path)})
+        except SecretInVault as e:
+            return _fmt({"exported": False, "error": "secret_rejected", "message": str(e)})
         except Exception as e:
             return _fmt({"exported": False, "error": str(e)})
 

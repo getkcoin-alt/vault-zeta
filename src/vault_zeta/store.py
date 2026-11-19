@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import html
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 from .models import EventRecord, MemoryRecord, MissionSnapshot
-from .redact import assert_clean
+from .redact import assert_clean, assert_clean_structure
 
 
 class RevisionConflict(RuntimeError):
@@ -28,56 +30,59 @@ class VaultZetaStore:
     def __init__(self, path: str | Path = "vault_zeta.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
-        self.db.execute("PRAGMA journal_mode = WAL")
-        self._init_schema()
+        self._lock = threading.RLock()
+        with self._lock:
+            self.db = sqlite3.connect(self.path, check_same_thread=False)
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA foreign_keys = ON")
+            self.db.execute("PRAGMA journal_mode = WAL")
+            self._init_schema()
 
     def _init_schema(self) -> None:
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                content TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                source TEXT,
-                source_fingerprint TEXT,
-                confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
-                metadata_json TEXT NOT NULL,
-                stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0, 1)),
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+        with self._lock:
+            self.db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    source TEXT,
+                    source_fingerprint TEXT,
+                    confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+                    metadata_json TEXT NOT NULL,
+                    stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0, 1)),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                memory_id UNINDEXED,
-                content,
-                scope
-            );
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    memory_id UNINDEXED,
+                    content,
+                    scope
+                );
 
-            CREATE TABLE IF NOT EXISTS mission_events (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                mission_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+                CREATE TABLE IF NOT EXISTS mission_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mission_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_mission_events_mission_seq
-            ON mission_events(mission_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_mission_events_mission_seq
+                ON mission_events(mission_id, seq);
 
-            CREATE TABLE IF NOT EXISTS mission_snapshots (
-                mission_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-        self.db.commit()
+                CREATE TABLE IF NOT EXISTS mission_snapshots (
+                    mission_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            self.db.commit()
 
     def add_memory(
         self,
@@ -90,6 +95,9 @@ class VaultZetaStore:
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
         memory_id: str | None = None,
+        stale: bool = False,
+        created_at: str | None = None,
+        updated_at: str | None = None,
         reject_secrets: bool = True,
     ) -> MemoryRecord:
         if kind not in self.MEMORY_KINDS:
@@ -107,17 +115,20 @@ class VaultZetaStore:
             assert_clean(content, "memory content")
             if source:
                 assert_clean(source, "memory source")
+            if metadata:
+                assert_clean_structure(metadata, "memory metadata")
 
         memory_id = memory_id or str(uuid.uuid4())
         metadata_json = json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"))
+        stale_int = 1 if stale else 0
 
-        with self.db:
+        with self._lock, self.db:
             self.db.execute(
                 """
                 INSERT INTO memories (
                     id, kind, content, scope, source, source_fingerprint,
-                    confidence, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, metadata_json, stale, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, CURRENT_TIMESTAMP), coalesce(?, CURRENT_TIMESTAMP))
                 """,
                 (
                     memory_id,
@@ -128,6 +139,9 @@ class VaultZetaStore:
                     source_fingerprint,
                     confidence,
                     metadata_json,
+                    stale_int,
+                    created_at,
+                    updated_at,
                 ),
             )
             self.db.execute(
@@ -138,10 +152,11 @@ class VaultZetaStore:
         return self.get_memory(memory_id)
 
     def get_memory(self, memory_id: str) -> MemoryRecord:
-        row = self.db.execute(
-            "SELECT * FROM memories WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
         if row is None:
             raise KeyError(memory_id)
         return self._memory(row)
@@ -178,36 +193,37 @@ class VaultZetaStore:
 
         where = (" AND " + " AND ".join(clauses)) if clauses else ""
 
-        if tokens:
-            fts_query = " ".join(f'"{token}"' for token in tokens)
-            rows = self.db.execute(
-                f"""
-                SELECT m.*
-                FROM memories_fts f
-                JOIN memories m ON m.id = f.memory_id
-                WHERE memories_fts MATCH ? {where}
-                ORDER BY bm25(memories_fts), m.confidence DESC, m.updated_at DESC
-                LIMIT ?
-                """,
-                [fts_query, *params, limit],
-            ).fetchall()
-        else:
-            rows = self.db.execute(
-                f"""
-                SELECT m.*
-                FROM memories m
-                WHERE 1 = 1 {where}
-                ORDER BY m.confidence DESC, m.updated_at DESC
-                LIMIT ?
-                """,
-                [*params, limit],
-            ).fetchall()
+        with self._lock:
+            if tokens:
+                fts_query = " ".join(f'"{token}"' for token in tokens)
+                rows = self.db.execute(
+                    f"""
+                    SELECT m.*
+                    FROM memories_fts f
+                    JOIN memories m ON m.id = f.memory_id
+                    WHERE memories_fts MATCH ? {where}
+                    ORDER BY bm25(memories_fts), m.confidence DESC, m.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [fts_query, *params, limit],
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    f"""
+                    SELECT m.*
+                    FROM memories m
+                    WHERE 1 = 1 {where}
+                    ORDER BY m.confidence DESC, m.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*params, limit],
+                ).fetchall()
 
         return [self._memory(row) for row in rows]
 
     def mark_source_stale(self, source: str, *, current_fingerprint: str) -> int:
         """Mark memories stale when their source no longer matches the supplied fingerprint."""
-        with self.db:
+        with self._lock, self.db:
             cursor = self.db.execute(
                 """
                 UPDATE memories
@@ -219,7 +235,7 @@ class VaultZetaStore:
                 """,
                 (source, current_fingerprint),
             )
-        return cursor.rowcount
+            return cursor.rowcount
 
     def append_event(
         self,
@@ -227,32 +243,47 @@ class VaultZetaStore:
         mission_id: str,
         event_type: str,
         payload: dict[str, Any] | None = None,
+        created_at: str | None = None,
+        reject_secrets: bool = True,
     ) -> int:
         mission_id = mission_id.strip()
         event_type = event_type.strip()
         if not mission_id or not event_type:
             raise ValueError("mission_id and event_type must not be empty")
 
+        if reject_secrets and payload:
+            assert_clean_structure(payload, f"event payload ({mission_id})")
+
         payload_json = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
-        with self.db:
-            cursor = self.db.execute(
-                """
-                INSERT INTO mission_events(mission_id, event_type, payload_json)
-                VALUES (?, ?, ?)
-                """,
-                (mission_id, event_type, payload_json),
-            )
-        return int(cursor.lastrowid)
+        with self._lock, self.db:
+            if created_at:
+                cursor = self.db.execute(
+                    """
+                    INSERT INTO mission_events(mission_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (mission_id, event_type, payload_json, created_at),
+                )
+            else:
+                cursor = self.db.execute(
+                    """
+                    INSERT INTO mission_events(mission_id, event_type, payload_json)
+                    VALUES (?, ?, ?)
+                    """,
+                    (mission_id, event_type, payload_json),
+                )
+            return int(cursor.lastrowid)
 
     def events(self, mission_id: str, *, after_seq: int = 0) -> list[EventRecord]:
-        rows = self.db.execute(
-            """
-            SELECT * FROM mission_events
-            WHERE mission_id = ? AND seq > ?
-            ORDER BY seq ASC
-            """,
-            (mission_id, after_seq),
-        ).fetchall()
+        with self._lock:
+            rows = self.db.execute(
+                """
+                SELECT * FROM mission_events
+                WHERE mission_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (mission_id, after_seq),
+            ).fetchall()
         return [
             EventRecord(
                 seq=int(row["seq"]),
@@ -271,15 +302,21 @@ class VaultZetaStore:
         status: str,
         snapshot: dict[str, Any],
         expected_revision: int | None = None,
+        forced_revision: int | None = None,
+        updated_at: str | None = None,
+        reject_secrets: bool = True,
     ) -> int:
         mission_id = mission_id.strip()
         status = status.strip()
         if not mission_id or not status:
             raise ValueError("mission_id and status must not be empty")
 
+        if reject_secrets:
+            assert_clean_structure(snapshot, f"mission snapshot ({mission_id})")
+
         snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
 
-        with self.db:
+        with self._lock, self.db:
             existing = self.db.execute(
                 "SELECT revision FROM mission_snapshots WHERE mission_id = ?",
                 (mission_id,),
@@ -290,15 +327,25 @@ class VaultZetaStore:
                     raise RevisionConflict(
                         f"mission {mission_id!r} does not exist; expected revision {expected_revision}"
                     )
-                revision = 1
-                self.db.execute(
-                    """
-                    INSERT INTO mission_snapshots(
-                        mission_id, status, snapshot_json, revision
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (mission_id, status, snapshot_json, revision),
-                )
+                revision = forced_revision if forced_revision is not None else 1
+                if updated_at:
+                    self.db.execute(
+                        """
+                        INSERT INTO mission_snapshots(
+                            mission_id, status, snapshot_json, revision, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (mission_id, status, snapshot_json, revision, updated_at),
+                    )
+                else:
+                    self.db.execute(
+                        """
+                        INSERT INTO mission_snapshots(
+                            mission_id, status, snapshot_json, revision
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (mission_id, status, snapshot_json, revision),
+                    )
                 return revision
 
             current = int(existing["revision"])
@@ -307,23 +354,35 @@ class VaultZetaStore:
                     f"mission {mission_id!r} is revision {current}, not {expected_revision}"
                 )
 
-            revision = current + 1
-            self.db.execute(
-                """
-                UPDATE mission_snapshots
-                SET status = ?, snapshot_json = ?, revision = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE mission_id = ?
-                """,
-                (status, snapshot_json, revision, mission_id),
-            )
+            revision = forced_revision if forced_revision is not None else (current + 1)
+            if updated_at:
+                self.db.execute(
+                    """
+                    UPDATE mission_snapshots
+                    SET status = ?, snapshot_json = ?, revision = ?,
+                        updated_at = ?
+                    WHERE mission_id = ?
+                    """,
+                    (status, snapshot_json, revision, updated_at, mission_id),
+                )
+            else:
+                self.db.execute(
+                    """
+                    UPDATE mission_snapshots
+                    SET status = ?, snapshot_json = ?, revision = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ?
+                    """,
+                    (status, snapshot_json, revision, mission_id),
+                )
             return revision
 
     def load_mission(self, mission_id: str) -> MissionSnapshot | None:
-        row = self.db.execute(
-            "SELECT * FROM mission_snapshots WHERE mission_id = ?",
-            (mission_id,),
-        ).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM mission_snapshots WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()
         if row is None:
             return None
         return MissionSnapshot(
@@ -347,7 +406,8 @@ class VaultZetaStore:
 
         Vault Zeta memory is context, not permission. By packaging recalled facts
         in an explicit <vault_memories> block with safety warnings, we protect
-        against prompt injections from retrieved text.
+        against prompt injections from retrieved text. Memory contents are escaped
+        so that nested tags cannot break delimiter boundaries.
         """
         hits = self.search(query, scope=scope, kinds=kinds, limit=limit)
         header = (
@@ -361,7 +421,9 @@ class VaultZetaStore:
         used = len(header) + len(footer)
         included = 0
         for h in hits:
-            line = f"- [{h.kind} | {h.scope} | conf={h.confidence:.2f}] {h.content}\n"
+            # Escape XML special characters to prevent delimiter breakouts
+            escaped_content = html.escape(h.content, quote=False)
+            line = f"- [{h.kind} | {h.scope} | conf={h.confidence:.2f}] {escaped_content}\n"
             if used + len(line) > max_chars:
                 break
             parts.append(line)
@@ -386,7 +448,8 @@ class VaultZetaStore:
         return import_bundle(self, input_dir)
 
     def close(self) -> None:
-        self.db.close()
+        with self._lock:
+            self.db.close()
 
     def __enter__(self) -> "VaultZetaStore":
         return self
