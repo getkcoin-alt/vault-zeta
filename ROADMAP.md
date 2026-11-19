@@ -2,7 +2,7 @@
 
 This is a direction, not a release promise.
 
-## 0.1 — public alpha
+## 0.1 — public alpha (completed)
 
 - durable typed memory
 - provenance and source fingerprints
@@ -13,33 +13,33 @@ This is a direction, not a release promise.
 - optimistic revision checks
 - tests and contributor setup
 
-## 0.2 — retrieval that can be measured
+## 0.2 — retrieval that can be measured (completed)
 
-- retrieval evaluation fixtures
-- correction and supersession links
-- optional entity index
-- optional embedding adapter
-- explainable score breakdown
-- import/export format with provenance preserved
+- retrieval evaluation and benchmarking harness (`eval.py`, MRR, Precision@K, Recall@K)
+- correction and supersession links (`supersedes_id`, `superseded_by`)
+- entity indexing and semantic relationship history (`entities`, `memory_entities`)
+- explainable score breakdown with BM25, confidence, and recency (`search_explain`)
+- import/export bundle format v1.1.0 with provenance, entities, and lineages preserved
+- MCP tools for supersession, lineage, explainable search, and entity navigation
 
-## 0.3 — long-running work
+## 0.3 — long-running work & mission continuity (next)
 
-- task graph primitives
+- task graph primitives and dependency tracking
 - pause/resume/correction event helpers
 - recovery tests across process restarts
-- retention policies
-- safer migrations
-- Scrappy Forge adapter
+- deterministic event replay harnesses
+- retention and compaction policies
+- Scrappy Forge and CANOPY adapters
 
 ## Later
 
-- encryption options
+- optional embedding adapter and hybrid lexical/vector ranking
+- encryption at rest options
 - PostgreSQL backend
 - multi-device sync experiments
-- CANOPY adapter
 - conflict resolution between stores
-- signed/exportable continuity bundles
-- long-duration simulations
+- signed continuity bundles
+- long-duration multi-agent simulations
 
 ## Things I do not want to fake
 

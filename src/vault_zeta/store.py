@@ -9,7 +9,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import EventRecord, MemoryRecord, MissionSnapshot
+from .models import (
+    EntityRecord,
+    EventRecord,
+    MemoryEntityLink,
+    MemoryRecord,
+    MissionSnapshot,
+    SearchScoreBreakdown,
+)
 from .redact import assert_clean, assert_clean_structure
 
 
@@ -53,7 +60,9 @@ class VaultZetaStore:
                     metadata_json TEXT NOT NULL,
                     stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0, 1)),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    supersedes_id TEXT REFERENCES memories(id),
+                    superseded_by TEXT REFERENCES memories(id)
                 );
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -82,6 +91,38 @@ class VaultZetaStore:
                 );
                 """
             )
+
+            # Migration for existing memories tables lacking lineage columns
+            cols = {row["name"] for row in self.db.execute("PRAGMA table_info(memories)").fetchall()}
+            if "supersedes_id" not in cols:
+                self.db.execute("ALTER TABLE memories ADD COLUMN supersedes_id TEXT REFERENCES memories(id)")
+            if "superseded_by" not in cols:
+                self.db.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT REFERENCES memories(id)")
+
+            self.db.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes_id);
+                CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
+
+                CREATE TABLE IF NOT EXISTS entities (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, type);
+
+                CREATE TABLE IF NOT EXISTS memory_entities (
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    relationship TEXT NOT NULL DEFAULT 'mentions',
+                    PRIMARY KEY (memory_id, entity_id, relationship)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_entities_memory ON memory_entities(memory_id);
+                """
+            )
             self.db.commit()
 
     def add_memory(
@@ -98,6 +139,8 @@ class VaultZetaStore:
         stale: bool = False,
         created_at: str | None = None,
         updated_at: str | None = None,
+        supersedes_id: str | None = None,
+        superseded_by: str | None = None,
         reject_secrets: bool = True,
     ) -> MemoryRecord:
         if kind not in self.MEMORY_KINDS:
@@ -127,8 +170,9 @@ class VaultZetaStore:
                 """
                 INSERT INTO memories (
                     id, kind, content, scope, source, source_fingerprint,
-                    confidence, metadata_json, stale, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, CURRENT_TIMESTAMP), coalesce(?, CURRENT_TIMESTAMP))
+                    confidence, metadata_json, stale, created_at, updated_at,
+                    supersedes_id, superseded_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, CURRENT_TIMESTAMP), coalesce(?, CURRENT_TIMESTAMP), ?, ?)
                 """,
                 (
                     memory_id,
@@ -142,6 +186,8 @@ class VaultZetaStore:
                     stale_int,
                     created_at,
                     updated_at,
+                    supersedes_id,
+                    superseded_by,
                 ),
             )
             self.db.execute(
@@ -150,6 +196,232 @@ class VaultZetaStore:
             )
 
         return self.get_memory(memory_id)
+
+    def supersede_memory(
+        self,
+        old_memory_id: str,
+        new_content: str,
+        *,
+        reason: str = "",
+        confidence: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+        scope: str | None = None,
+        kind: str | None = None,
+        source: str | None = None,
+        source_fingerprint: str | None = None,
+        reject_secrets: bool = True,
+    ) -> MemoryRecord:
+        """Mark an existing memory as superseded and create a new replacement memory with explicit lineage."""
+        with self._lock, self.db:
+            old = self.get_memory(old_memory_id)
+            if old.superseded_by:
+                raise ValueError(
+                    f"Memory {old_memory_id} has already been superseded by {old.superseded_by}"
+                )
+
+            new_metadata = dict(metadata or {})
+            if reason:
+                new_metadata["superseded_reason"] = reason
+
+            new_id = str(uuid.uuid4())
+            new_memory = self.add_memory(
+                kind=kind or old.kind,
+                content=new_content,
+                scope=scope or old.scope,
+                source=source if source is not None else old.source,
+                source_fingerprint=source_fingerprint if source_fingerprint is not None else old.source_fingerprint,
+                confidence=confidence,
+                metadata=new_metadata,
+                memory_id=new_id,
+                supersedes_id=old_memory_id,
+                reject_secrets=reject_secrets,
+            )
+
+            self.db.execute(
+                """
+                UPDATE memories
+                SET superseded_by = ?, stale = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (new_id, old_memory_id),
+            )
+
+            # Preserve entity relationships from old memory to new memory
+            old_entities = self.get_entities_for_memory(old_memory_id)
+            for link in old_entities:
+                self.db.execute(
+                    """
+                    INSERT INTO memory_entities (memory_id, entity_id, relationship)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (new_id, link.entity_id, link.relationship),
+                )
+
+            return new_memory
+
+    def get_lineage(self, memory_id: str) -> list[MemoryRecord]:
+        """Return the chronological lineage chain of a memory (all ancestors and descendants)."""
+        with self._lock:
+            # 1. Walk backward to root ancestor
+            ancestors: list[MemoryRecord] = []
+            curr_id = memory_id
+            visited = set()
+            while curr_id and curr_id not in visited:
+                visited.add(curr_id)
+                rec = self.get_memory(curr_id)
+                if curr_id != memory_id:
+                    ancestors.append(rec)
+                curr_id = rec.supersedes_id
+
+            ancestors.reverse()
+
+            target = self.get_memory(memory_id)
+
+            # 2. Walk forward to latest descendant
+            descendants: list[MemoryRecord] = []
+            curr_id = target.superseded_by
+            while curr_id and curr_id not in visited:
+                visited.add(curr_id)
+                rec = self.get_memory(curr_id)
+                descendants.append(rec)
+                curr_id = rec.superseded_by
+
+            return [*ancestors, target, *descendants]
+
+    def index_entity(
+        self,
+        name: str,
+        type: str = "concept",
+        metadata: dict[str, Any] | None = None,
+    ) -> EntityRecord:
+        """Create or retrieve a named entity record."""
+        name = name.strip()
+        type = type.strip().lower()
+        if not name or not type:
+            raise ValueError("Entity name and type must not be empty")
+
+        metadata = metadata or {}
+        assert_clean_structure(metadata, f"entity metadata ({name})")
+        metadata_json = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+        with self._lock, self.db:
+            row = self.db.execute(
+                "SELECT * FROM entities WHERE name = ? AND type = ?",
+                (name, type),
+            ).fetchone()
+            if row:
+                return EntityRecord(
+                    id=row["id"],
+                    name=row["name"],
+                    type=row["type"],
+                    metadata=json.loads(row["metadata_json"]),
+                    created_at=row["created_at"],
+                )
+
+            entity_id = str(uuid.uuid4())
+            self.db.execute(
+                "INSERT INTO entities (id, name, type, metadata_json) VALUES (?, ?, ?, ?)",
+                (entity_id, name, type, metadata_json),
+            )
+            return EntityRecord(
+                id=entity_id,
+                name=name,
+                type=type,
+                metadata=metadata,
+                created_at="now",
+            )
+
+    def link_memory_entity(
+        self,
+        memory_id: str,
+        entity_name: str,
+        entity_type: str = "concept",
+        relationship: str = "mentions",
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryEntityLink:
+        """Link a memory to an entity with a specific semantic relationship."""
+        with self._lock, self.db:
+            _ = self.get_memory(memory_id)
+            entity = self.index_entity(entity_name, entity_type, metadata)
+            rel = relationship.strip().lower()
+
+            self.db.execute(
+                """
+                INSERT INTO memory_entities (memory_id, entity_id, relationship)
+                VALUES (?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (memory_id, entity.id, rel),
+            )
+            return MemoryEntityLink(
+                memory_id=memory_id,
+                entity_id=entity.id,
+                entity_name=entity.name,
+                entity_type=entity.type,
+                relationship=rel,
+            )
+
+    def get_entities_for_memory(self, memory_id: str) -> list[MemoryEntityLink]:
+        """Return all entities linked to a specific memory."""
+        with self._lock:
+            rows = self.db.execute(
+                """
+                SELECT me.memory_id, me.entity_id, e.name as entity_name, e.type as entity_type, me.relationship
+                FROM memory_entities me
+                JOIN entities e ON e.id = me.entity_id
+                WHERE me.memory_id = ?
+                ORDER BY e.name ASC
+                """,
+                (memory_id,),
+            ).fetchall()
+            return [
+                MemoryEntityLink(
+                    memory_id=r["memory_id"],
+                    entity_id=r["entity_id"],
+                    entity_name=r["entity_name"],
+                    entity_type=r["entity_type"],
+                    relationship=r["relationship"],
+                )
+                for r in rows
+            ]
+
+    def get_entity_memories(
+        self,
+        entity_name: str,
+        entity_type: str | None = None,
+        relationship: str | None = None,
+        include_stale: bool = False,
+        include_superseded: bool = False,
+    ) -> list[MemoryRecord]:
+        """Return all memories referencing a given entity name."""
+        with self._lock:
+            clauses = ["e.name = ?"]
+            params: list[Any] = [entity_name.strip()]
+            if entity_type:
+                clauses.append("e.type = ?")
+                params.append(entity_type.strip().lower())
+            if relationship:
+                clauses.append("me.relationship = ?")
+                params.append(relationship.strip().lower())
+            if not include_stale:
+                clauses.append("m.stale = 0")
+            if not include_superseded:
+                clauses.append("m.superseded_by IS NULL")
+
+            where = " AND ".join(clauses)
+            rows = self.db.execute(
+                f"""
+                SELECT m.*
+                FROM memories m
+                JOIN memory_entities me ON me.memory_id = m.id
+                JOIN entities e ON e.id = me.entity_id
+                WHERE {where}
+                ORDER BY m.confidence DESC, m.updated_at DESC
+                """,
+                params,
+            ).fetchall()
+            return [self._memory(r) for r in rows]
 
     def get_memory(self, memory_id: str) -> MemoryRecord:
         with self._lock:
@@ -168,6 +440,7 @@ class VaultZetaStore:
         scope: str | None = None,
         kinds: Iterable[str] | None = None,
         include_stale: bool = False,
+        include_superseded: bool = False,
         limit: int = 10,
     ) -> list[MemoryRecord]:
         if limit < 1 or limit > 100:
@@ -184,6 +457,8 @@ class VaultZetaStore:
 
         if not include_stale:
             clauses.append("m.stale = 0")
+        if not include_superseded:
+            clauses.append("m.superseded_by IS NULL")
         if scope is not None:
             clauses.append("m.scope = ?")
             params.append(scope)
@@ -195,7 +470,12 @@ class VaultZetaStore:
 
         with self._lock:
             if tokens:
-                fts_query = " ".join(f'"{token}"' for token in tokens)
+                if len(tokens) == 1:
+                    fts_query = f'"{tokens[0]}"'
+                else:
+                    phrase = " ".join(f'"{token}"' for token in tokens)
+                    or_terms = " OR ".join(f'"{token}"' for token in tokens)
+                    fts_query = f"({phrase}) OR ({or_terms})"
                 rows = self.db.execute(
                     f"""
                     SELECT m.*
@@ -220,6 +500,118 @@ class VaultZetaStore:
                 ).fetchall()
 
         return [self._memory(row) for row in rows]
+
+    def search_explain(
+        self,
+        query: str,
+        *,
+        scope: str | None = None,
+        kinds: Iterable[str] | None = None,
+        include_stale: bool = False,
+        include_superseded: bool = False,
+        limit: int = 10,
+    ) -> list[SearchScoreBreakdown]:
+        """Explainable retrieval ranking breakdown with BM25, confidence, and recency weights."""
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+
+        kind_list = tuple(kinds or ())
+        unknown = set(kind_list) - self.MEMORY_KINDS
+        if unknown:
+            raise ValueError(f"Unsupported memory kinds: {sorted(unknown)}")
+
+        tokens = re.findall(r"[A-Za-z0-9_]+", query)
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if not include_stale:
+            clauses.append("m.stale = 0")
+        if not include_superseded:
+            clauses.append("m.superseded_by IS NULL")
+        if scope is not None:
+            clauses.append("m.scope = ?")
+            params.append(scope)
+        if kind_list:
+            clauses.append("m.kind IN (" + ",".join("?" for _ in kind_list) + ")")
+            params.extend(kind_list)
+
+        where = (" AND " + " AND ".join(clauses)) if clauses else ""
+
+        with self._lock:
+            if tokens:
+                if len(tokens) == 1:
+                    fts_query = f'"{tokens[0]}"'
+                else:
+                    phrase = " ".join(f'"{token}"' for token in tokens)
+                    or_terms = " OR ".join(f'"{token}"' for token in tokens)
+                    fts_query = f"({phrase}) OR ({or_terms})"
+                rows = self.db.execute(
+                    f"""
+                    SELECT m.*, bm25(memories_fts) AS bm25_score,
+                           julianday('now') - julianday(m.updated_at) AS days_ago
+                    FROM memories_fts f
+                    JOIN memories m ON m.id = f.memory_id
+                    WHERE memories_fts MATCH ? {where}
+                    ORDER BY bm25(memories_fts), m.confidence DESC, m.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [fts_query, *params, limit],
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    f"""
+                    SELECT m.*, 0.0 AS bm25_score,
+                           julianday('now') - julianday(m.updated_at) AS days_ago
+                    FROM memories m
+                    WHERE 1 = 1 {where}
+                    ORDER BY m.confidence DESC, m.updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*params, limit],
+                ).fetchall()
+
+        results: list[SearchScoreBreakdown] = []
+        for r in rows:
+            rec = self._memory(r)
+            bm25_raw = float(r["bm25_score"]) if r["bm25_score"] is not None else 0.0
+            days_ago = max(0.0, float(r["days_ago"]) if r["days_ago"] is not None else 0.0)
+
+            # SQLite FTS5 bm25 returns negative or zero: lower is better match.
+            match_intensity = max(0.0, -bm25_raw)
+            # Monotonic bounded normalization in [0, 1]
+            bm25_norm = match_intensity / (1.0 + match_intensity) if match_intensity > 0 else 0.0
+            confidence = rec.confidence
+            # Recency decay (half-life ~30 days)
+            recency = 1.0 / (1.0 + (days_ago / 30.0))
+
+            if tokens:
+                final_score = (0.60 * bm25_norm) + (0.25 * confidence) + (0.15 * recency)
+                explanation = (
+                    f"BM25 match quality {bm25_norm:.3f} (raw={bm25_raw:.2f}) [weight=0.60], "
+                    f"confidence {confidence:.2f} [weight=0.25], recency {recency:.2f} ({days_ago:.1f}d ago) [weight=0.15] "
+                    f"-> score {final_score:.3f}"
+                )
+            else:
+                final_score = (0.65 * confidence) + (0.35 * recency)
+                explanation = (
+                    f"No lexical tokens. Confidence {confidence:.2f} [weight=0.65], "
+                    f"recency {recency:.2f} ({days_ago:.1f}d ago) [weight=0.35] -> score {final_score:.3f}"
+                )
+
+            results.append(
+                SearchScoreBreakdown(
+                    memory=rec,
+                    bm25_raw=bm25_raw,
+                    bm25_normalized=bm25_norm,
+                    confidence_weight=confidence,
+                    recency_weight=recency,
+                    final_score=final_score,
+                    explanation=explanation,
+                )
+            )
+
+        results.sort(key=lambda s: s.final_score, reverse=True)
+        return results
 
     def mark_source_stale(self, source: str, *, current_fingerprint: str) -> int:
         """Mark memories stale when their source no longer matches the supplied fingerprint."""
@@ -311,11 +703,10 @@ class VaultZetaStore:
         if not mission_id or not status:
             raise ValueError("mission_id and status must not be empty")
 
-        if reject_secrets:
+        if reject_secrets and snapshot:
             assert_clean_structure(snapshot, f"mission snapshot ({mission_id})")
 
         snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
-
         with self._lock, self.db:
             existing = self.db.execute(
                 "SELECT revision FROM mission_snapshots WHERE mission_id = ?",
@@ -349,7 +740,7 @@ class VaultZetaStore:
                 return revision
 
             current = int(existing["revision"])
-            if expected_revision is not None and expected_revision != current:
+            if expected_revision is not None and current != expected_revision:
                 raise RevisionConflict(
                     f"mission {mission_id!r} is revision {current}, not {expected_revision}"
                 )
@@ -421,7 +812,6 @@ class VaultZetaStore:
         used = len(header) + len(footer)
         included = 0
         for h in hits:
-            # Escape XML special characters to prevent delimiter breakouts
             escaped_content = html.escape(h.content, quote=False)
             line = f"- [{h.kind} | {h.scope} | conf={h.confidence:.2f}] {escaped_content}\n"
             if used + len(line) > max_chars:
@@ -459,6 +849,7 @@ class VaultZetaStore:
 
     @staticmethod
     def _memory(row: sqlite3.Row) -> MemoryRecord:
+        keys = row.keys()
         return MemoryRecord(
             id=row["id"],
             kind=row["kind"],
@@ -471,4 +862,6 @@ class VaultZetaStore:
             stale=bool(row["stale"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            supersedes_id=row["supersedes_id"] if "supersedes_id" in keys else None,
+            superseded_by=row["superseded_by"] if "superseded_by" in keys else None,
         )

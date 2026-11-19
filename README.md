@@ -6,7 +6,7 @@ Close the session, change the model, move to another machine, or come back a mon
 
 **Vault Zeta is an experimental continuity layer for long-running AI systems.**
 
-Not “infinite memory”. Not a magic brain dump. The goal is much more practical: keep useful state, where it came from, how confident we are in it, whether the source has changed, and what happened during a long-running mission.
+Not “infinite memory”. Not a magic brain dump. The goal is much more practical: keep useful state, where it came from, how confident we are in it, whether the source has changed, what evolved through corrections, and what happened during a long-running mission.
 
 I sometimes call it **the daddy of the future** 😅🌠. The repository is where that joke has to survive contact with code.
 
@@ -16,30 +16,36 @@ flowchart LR
     Z --> M[Memory + provenance]
     Z --> E[Append-only events]
     Z --> S[Mission snapshot]
-    M --> DB[(SQLite)]
+    Z --> K[Entity Graph & Lineage]
+    M --> DB[(SQLite + FTS5)]
     E --> DB
     S --> DB
+    K --> DB
 ```
 
 The storage is intentionally boring right now. I want the continuity model to be understandable before making it distributed, embedded, or clever.
 
 ## What exists today
 
-The public release includes:
+The current release (0.2.2) includes:
 
-- SQLite-backed durable memory
+- SQLite-backed durable memory with zero external service dependencies
 - Model Context Protocol (MCP) server for OpenCode, Claude Code, Cursor, and any MCP-compatible agent
 - Memory kinds such as episodic, semantic, procedural, failure, entity and preference
 - Scope, provenance and confidence on memory records
 - Source fingerprints and stale-memory marking
-- Lexical retrieval with SQLite FTS5
+- FTS5 lexical retrieval with composite phrase/OR ranking
+- Explicit supersession links (`supersedes_id`, `superseded_by`) and lineage tracking (`get_lineage`)
+- Entity indexing and relationship tracking (`entities`, `memory_entities`)
+- Explainable retrieval ranking with BM25 score, confidence weight, and recency breakdown (`search_explain`)
+- Ground-truth retrieval evaluation and benchmarking harness (`eval.py`, MRR, Precision@K, Recall@K)
 - Untrusted data boundary context packaging (`context_pack`) to prevent memory-based prompt injections
-- Automatic secret and credential leak detection (`redact.py`) on memory writes
-- Portable directory bundle export (`bundle_export`) and deduplicated import (`bundle_import`)
+- Automatic secret and credential leak detection (`redact.py`) across content, metadata, payloads, and snapshots
+- Portable directory bundle export (`bundle_export`) and deduplicated import (`bundle_import`) with v1.1.0 entity preservation
 - Append-only mission event journal
 - Durable mission snapshots with optimistic revision checks
-- JSON metadata instead of hidden in-memory state
-- Comprehensive test suite for persistence, continuity, redaction, and MCP behavior
+- Thread-safe SQLite concurrency (`RLock`) for async multi-agent workloads
+- Comprehensive test suite for persistence, continuity, lineage, entities, redaction, and MCP behavior
 
 The important rule is:
 
@@ -86,7 +92,20 @@ with VaultZetaStore("zeta.db") as zeta:
         confidence=0.95,
     )
 
-    hits = zeta.search("irrigation moisture", scope="canopy/greenhouse")
+    # Link to entity
+    zeta.link_memory_entity(memory.id, "Irrigation Controller", entity_type="hardware", relationship="describes")
+
+    # Correct/supersede a memory when facts evolve
+    updated = zeta.supersede_memory(
+        old_memory_id=memory.id,
+        new_content="The greenhouse irrigation controller uses dynamic sensor-fused moisture targets.",
+        reason="Upgraded control algorithm to firmware v2",
+    )
+
+    # Search with explainable ranking
+    breakdown = zeta.search_explain("irrigation moisture targets", scope="canopy/greenhouse")
+    for hit in breakdown:
+        print(hit.explanation)
 
     seq = zeta.append_event(
         mission_id="mission-42",
@@ -112,6 +131,7 @@ A memory record stores:
 - `source_fingerprint`
 - `confidence`
 - `metadata`
+- `supersedes_id` and `superseded_by`
 - timestamps
 - stale/fresh state
 
@@ -163,17 +183,23 @@ Or configure in `opencode.json`:
 | Tool | Purpose |
 |---|---|
 | `memory_save` | Persist a durable fact with kind, scope, source, and confidence. Rejects secrets automatically. |
-| `memory_search` | FTS5 lexical search across stored memories with optional scope/kind filters. |
+| `memory_supersede` | Correct/replace an obsolete memory with an explicit lineage link and reason. |
+| `memory_lineage` | Retrieve full chronological chain of ancestors and replacements for a memory. |
+| `memory_search` | FTS5 lexical search across stored memories with phrase and term scoring. |
+| `memory_search_explain` | Search with explainable breakdown of BM25 score, confidence weight, and recency. |
+| `memory_mark_stale` | Mark memories stale when their source file or document fingerprint changes. |
+| `entity_link` | Link a memory to a named entity (technology, repo, policy, concept) with a relationship. |
+| `entity_get_memories` | Retrieve all active memories referencing a given entity. |
 | `context_pack` | Return recalled facts formatted safely within `<vault_memories>` prompt injection boundaries. |
 | `memory_list` | Browse recent memories newest-first. |
 | `memory_delete` | Remove a memory by UUID. |
-| `vault_status` | Health, DB location, memory counts, and mission stats. |
+| `vault_status` | Health, DB location, memory, entity, mission, and event counts. |
 | `event_append` | Append an observation, tool result, or step to a mission's append-only journal. |
 | `event_list` | Read ordered mission events. |
 | `mission_save` | Save/update a mission snapshot with optimistic revision concurrency. |
 | `mission_load` | Load a mission snapshot to resume execution. |
-| `bundle_export` | Export vault into a portable directory bundle. |
-| `bundle_import` | Import and deduplicate a portable bundle directory. |
+| `bundle_export` | Export vault into a portable directory bundle with entity and lineage graphs. |
+| `bundle_import` | Import and deduplicate a portable bundle directory without foreign key hazards. |
 
 ## What Vault Zeta is not
 
@@ -194,11 +220,8 @@ The current alpha gives us a clean place to test continuity mechanisms before ad
 The next useful steps are:
 
 - optional embedding adapters without making embeddings mandatory
-- entity links and relationship history
-- resumable task-graph primitives
-- correction/supersession semantics
-- import/export with provenance preserved
-- retrieval evaluation instead of “memory feels good”
+- resumable task-graph primitives (Phase 2)
+- pause/resume/replay safety harnesses
 - encryption options for sensitive local stores
 - adapters for Scrappy Forge and CANOPY
 - long-duration simulations that deliberately test stale and conflicting memory

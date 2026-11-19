@@ -17,6 +17,37 @@ class MemoryRecord:
     stale: bool
     created_at: str
     updated_at: str
+    supersedes_id: str | None = None
+    superseded_by: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EntityRecord:
+    id: str
+    name: str
+    type: str
+    metadata: dict[str, Any]
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEntityLink:
+    memory_id: str
+    entity_id: str
+    entity_name: str
+    entity_type: str
+    relationship: str
+
+
+@dataclass(frozen=True, slots=True)
+class SearchScoreBreakdown:
+    memory: MemoryRecord
+    bm25_raw: float
+    bm25_normalized: float
+    confidence_weight: float
+    recency_weight: float
+    final_score: float
+    explanation: str
 
 
 @dataclass(frozen=True, slots=True)

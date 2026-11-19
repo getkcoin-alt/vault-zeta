@@ -2,7 +2,9 @@
 
 A bundle is a self-contained directory with:
 - manifest.json: protocol version, vault_id, export timestamp, record counts
-- memories.jsonl: durable memory records (content, kind, scope, source, confidence)
+- memories.jsonl: durable memory records (content, kind, scope, source, confidence, lineage)
+- entities.jsonl: named entities (optional)
+- memory_entities.jsonl: memory-entity relationships (optional)
 - events.jsonl: append-only mission events
 - snapshots.jsonl: mission state snapshots
 - state.json: counters and provenance metadata
@@ -23,7 +25,7 @@ from pathlib import Path
 from .models import EventRecord, MissionSnapshot
 from .redact import assert_clean, assert_clean_structure
 
-PROTOCOL_VERSION = "1.0.0"
+PROTOCOL_VERSION = "1.1.0"
 
 
 def utc_now_iso() -> str:
@@ -96,10 +98,48 @@ def export_bundle(
                 "stale": m.stale,
                 "created_at": m.created_at,
                 "updated_at": m.updated_at,
+                "supersedes_id": m.supersedes_id,
+                "superseded_by": m.superseded_by,
             }
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
-    # 2. Events (Scan payloads)
+    # 2. Entities & Relationships (if any)
+    entity_rows = store.db.execute("SELECT * FROM entities ORDER BY name ASC").fetchall()
+    entities = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "type": r["type"],
+            "metadata": json.loads(r["metadata_json"]),
+            "created_at": r["created_at"],
+        }
+        for r in entity_rows
+    ]
+    for e in entities:
+        assert_clean(e["name"], f"entity {e['id']} name")
+        if e["metadata"]:
+            assert_clean_structure(e["metadata"], f"entity {e['id']} metadata")
+
+    if entities:
+        with (out / "entities.jsonl").open("w", encoding="utf-8") as f:
+            for e in entities:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+    link_rows = store.db.execute("SELECT * FROM memory_entities").fetchall()
+    links = [
+        {
+            "memory_id": r["memory_id"],
+            "entity_id": r["entity_id"],
+            "relationship": r["relationship"],
+        }
+        for r in link_rows
+    ]
+    if links:
+        with (out / "memory_entities.jsonl").open("w", encoding="utf-8") as f:
+            for link in links:
+                f.write(json.dumps(link, ensure_ascii=False) + "\n")
+
+    # 3. Events (Scan payloads)
     event_rows = store.db.execute("SELECT * FROM mission_events ORDER BY seq ASC").fetchall()
     events = [
         EventRecord(
@@ -131,7 +171,7 @@ def export_bundle(
                 + "\n"
             )
 
-    # 3. Snapshots (Scan snapshots)
+    # 4. Snapshots (Scan snapshots)
     snap_rows = store.db.execute("SELECT * FROM mission_snapshots").fetchall()
     snapshots = [
         MissionSnapshot(
@@ -163,12 +203,14 @@ def export_bundle(
                 + "\n"
             )
 
-    # 4. Manifest
+    # 5. Manifest
     manifest = BundleManifest(
         protocol_version=PROTOCOL_VERSION,
         vault_id=vault_id,
         counts={
             "memories": len(memories),
+            "entities": len(entities),
+            "memory_entities": len(links),
             "events": len(events),
             "snapshots": len(snapshots),
         },
@@ -178,9 +220,10 @@ def export_bundle(
         encoding="utf-8",
     )
 
-    # 5. State
+    # 6. State
     state = {
         "memory_count": len(memories),
+        "entity_count": len(entities),
         "event_count": len(events),
         "snapshot_count": len(snapshots),
         "exported_at": manifest.exported_at,
@@ -193,7 +236,7 @@ def export_bundle(
 
 
 def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
-    """Import a bundle directory into store with composite deduplication and provenance preservation."""
+    """Import a bundle directory into store with composite deduplication, entities, and provenance preservation."""
     src = Path(input_dir)
     manifest_file = src / "manifest.json"
     if not manifest_file.is_file():
@@ -214,6 +257,8 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
     memories_skipped = 0
 
     memories_file = src / "memories.jsonl"
+    deferred_lineage: list[tuple[str, str | None, str | None]] = []
+
     if memories_file.is_file():
         with memories_file.open(encoding="utf-8") as f:
             for line in f:
@@ -230,6 +275,12 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
                     memories_skipped += 1
                     continue
 
+                mem_id = d.get("id")
+                s_id = d.get("supersedes_id")
+                s_by = d.get("superseded_by")
+                if s_id or s_by:
+                    deferred_lineage.append((mem_id, s_id, s_by))
+
                 store.add_memory(
                     kind=k,
                     content=c,
@@ -238,16 +289,71 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
                     source_fingerprint=d.get("source_fingerprint"),
                     confidence=float(d.get("confidence", 1.0)),
                     metadata=d.get("metadata"),
-                    memory_id=d.get("id"),
+                    memory_id=mem_id,
                     stale=bool(d.get("stale", False)),
                     created_at=d.get("created_at"),
                     updated_at=d.get("updated_at"),
+                    supersedes_id=None,
+                    superseded_by=None,
                     reject_secrets=True,
                 )
                 known_record_hashes.add(rh)
                 memories_added += 1
 
-    # 2. Existing event signatures to prevent event duplication
+        if deferred_lineage:
+            with store._lock, store.db:
+                for mem_id, s_id, s_by in deferred_lineage:
+                    store.db.execute(
+                        "UPDATE memories SET supersedes_id = ?, superseded_by = ? WHERE id = ?",
+                        (s_id, s_by, mem_id),
+                    )
+
+    # 2. Entities
+    entities_added = 0
+    entities_file = src / "entities.jsonl"
+    if entities_file.is_file():
+        with entities_file.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                meta_json = json.dumps(d.get("metadata") or {}, sort_keys=True, separators=(",", ":"))
+                with store._lock, store.db:
+                    cursor = store.db.execute(
+                        """
+                        INSERT INTO entities (id, name, type, metadata_json, created_at)
+                        VALUES (?, ?, ?, ?, coalesce(?, CURRENT_TIMESTAMP))
+                        ON CONFLICT(name, type) DO NOTHING
+                        """,
+                        (d["id"], d["name"], d["type"], meta_json, d.get("created_at")),
+                    )
+                    if cursor.rowcount > 0:
+                        entities_added += 1
+
+    # 3. Memory-Entity Links
+    links_added = 0
+    links_file = src / "memory_entities.jsonl"
+    if links_file.is_file():
+        with links_file.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                with store._lock, store.db:
+                    cursor = store.db.execute(
+                        """
+                        INSERT INTO memory_entities (memory_id, entity_id, relationship)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (d["memory_id"], d["entity_id"], d.get("relationship", "mentions")),
+                    )
+                    if cursor.rowcount > 0:
+                        links_added += 1
+
+    # 4. Existing event signatures to prevent event duplication
     existing_events = store.db.execute(
         "SELECT mission_id, event_type, payload_json, created_at FROM mission_events"
     ).fetchall()
@@ -285,7 +391,7 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
                 known_event_hashes.add(eh)
                 events_added += 1
 
-    # 3. Snapshots (preserves higher revision or creates new)
+    # 5. Snapshots (preserves higher revision or creates new)
     snapshots_added = 0
     snapshots_skipped = 0
     snaps_file = src / "snapshots.jsonl"
@@ -317,6 +423,8 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
     return {
         "memories_added": memories_added,
         "memories_skipped": memories_skipped,
+        "entities_added": entities_added,
+        "entity_links_added": links_added,
         "events_added": events_added,
         "events_skipped": events_skipped,
         "snapshots_added": snapshots_added,
