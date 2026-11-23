@@ -623,8 +623,37 @@ def create_server(db_path: str = DB_PATH) -> FastMCP:
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Vault Zeta MCP Server — persistent long-term memory & continuity"
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default=os.environ.get("VAULT_ZETA_TRANSPORT", "stdio"),
+        help="MCP transport protocol: stdio (default, for local clients), sse, or streamable-http (for remote/ChatGPT)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("VAULT_ZETA_HOST", "127.0.0.1"),
+        help="Host for HTTP/SSE transport (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("VAULT_ZETA_PORT", "8000")),
+        help="Port for HTTP/SSE transport (default: 8000)",
+    )
+    args = parser.parse_args()
+
     server = create_server()
-    server.run(transport="stdio")
+    if args.transport == "stdio":
+        server.run(transport="stdio")
+    elif args.transport == "sse":
+        server.run(transport="sse", host=args.host, port=args.port)
+    elif args.transport == "streamable-http":
+        server.run(transport="streamable-http", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
