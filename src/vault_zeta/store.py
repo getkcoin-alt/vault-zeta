@@ -47,7 +47,7 @@ class VaultZetaStore:
     }
 
     def __init__(self, path: str | Path = "vault_zeta.db") -> None:
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         with self._lock:
