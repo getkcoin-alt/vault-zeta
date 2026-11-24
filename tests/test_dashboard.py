@@ -106,5 +106,8 @@ def test_connect_only_returns_credentials_to_the_owner_on_an_explicit_same_origi
                 assert response.headers["cache-control"] == "no-store"
                 assert json.loads(response.json()["text"]) == expected
             assert client.post(copy_route, json={"client": "token"}, headers=headers).json() == {"text": token}
+            assert client.post(copy_route, json={"client": "header"}, headers=headers).json() == {
+                "text": f"Bearer {token}",
+            }
             token_file.unlink()
             assert client.post(copy_route, json={"client": "token"}, headers=headers).status_code == 503

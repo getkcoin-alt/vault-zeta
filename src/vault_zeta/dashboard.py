@@ -293,9 +293,16 @@ def connect_page(request: Request) -> HTMLResponse:
         + ('' if configured else '<p>The dashboard has no configured MCP credential.</p>')
         + '</section><p role="status" id="copy-status" class="copy-status"></p>'
         + f'<div class="panels">{cards}'
+        '<section class="panel"><h2>Claude web and desktop</h2>'
+        '<p class="empty">In Customize → Connectors, add a custom web connector using the URL above. '
+        'Select No sign in, then add an Authorization request header with the copied value.</p>'
+        '<div class="actions"><button type="button" data-client="header"'
+        f'{" disabled" if not configured else ""}>Copy header value</button>'
+        '<a href="https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp">'
+        'Setup guide</a></div></section>'
         '<section class="panel"><h2>ChatGPT</h2>'
-        '<p class="empty">ChatGPT custom apps sign in with MCP OAuth. OAuth is pending on this server.</p>'
-        '<div class="actions"><a href="https://developers.openai.com/api/docs/guides/custom-mcp-server">'
+        '<p class="empty">Connecting this private vault in ChatGPT requires MCP OAuth. OAuth setup is pending.</p>'
+        '<div class="actions"><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt">'
         'ChatGPT setup guide</a></div></section></div>'
         '<dialog id="copy-dialog"><form method="dialog"><h2>Copy manually</h2>'
         '<label>Connection details<textarea id="copy-text" rows="8" readonly></textarea></label>'
@@ -318,7 +325,7 @@ async def connect_copy(request: Request) -> JSONResponse:
     except ValueError as exc:
         raise HTTPException(400, "Invalid copy request") from exc
     client = payload.get("client") if isinstance(payload, dict) else None
-    if not isinstance(client, str) or (client != "token" and client not in CLIENTS):
+    if not isinstance(client, str) or (client not in ("token", "header") and client not in CLIENTS):
         raise HTTPException(400, "Unknown MCP client")
     try:
         token = token_file.read_text().strip()
@@ -326,7 +333,12 @@ async def connect_copy(request: Request) -> JSONResponse:
             raise OSError("Empty credential")
     except OSError as exc:
         raise HTTPException(503, "MCP credential is unavailable") from exc
-    value = token if client == "token" else json.dumps(client_config(client, url, token), indent=2)
+    if client == "token":
+        value = token
+    elif client == "header":
+        value = f"Bearer {token}"
+    else:
+        value = json.dumps(client_config(client, url, token), indent=2)
     return JSONResponse({"text": value}, headers=SECURITY_HEADERS)
 
 

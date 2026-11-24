@@ -1,11 +1,12 @@
-const status = document.querySelector("#copy-status");
+const copyStatus = document.querySelector("#copy-status");
 const dialog = document.querySelector("#copy-dialog");
 const fallback = document.querySelector("#copy-text");
+const labels = { token: "Bearer token", header: "Header value" };
 
 async function copyText(text, label) {
   try {
     await navigator.clipboard.writeText(text);
-    status.textContent = label + " copied.";
+    copyStatus.textContent = label + " copied.";
   } catch {
     fallback.value = text;
     dialog.showModal();
@@ -14,7 +15,7 @@ async function copyText(text, label) {
   }
 }
 
-if (status && dialog && fallback) {
+if (copyStatus && dialog && fallback) {
   dialog.addEventListener("close", () => { fallback.value = ""; });
   document.querySelector("[data-copy-url]").addEventListener("click", () => {
     copyText(document.querySelector("#mcp-url").textContent, "MCP URL");
@@ -22,7 +23,7 @@ if (status && dialog && fallback) {
   for (const button of document.querySelectorAll("[data-client]")) {
     button.addEventListener("click", async () => {
       button.disabled = true;
-      status.textContent = "";
+      copyStatus.textContent = "";
       try {
         const response = await fetch("/dashboard/connect/copy", {
           method: "POST",
@@ -32,9 +33,9 @@ if (status && dialog && fallback) {
         });
         if (!response.ok) throw new Error("Copy request failed");
         const result = await response.json();
-        await copyText(result.text, button.dataset.client === "token" ? "Bearer token" : "Configuration");
+        await copyText(result.text, labels[button.dataset.client] ?? "Configuration");
       } catch {
-        status.textContent = "Could not copy the connection details. Reload and try again.";
+        copyStatus.textContent = "Could not copy the connection details. Reload and try again.";
       } finally {
         button.disabled = false;
       }

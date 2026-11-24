@@ -175,8 +175,9 @@ python -m vault_zeta.dashboard --db /path/to/vault.db \
 
 Set `--mcp-url https://vault.example.com/mcp` to show the hosted endpoint on the
 dashboard’s Connect page. To enable copying authenticated configurations for Claude
-Code, OpenCode, and Antigravity, also set `--mcp-token-file` to a private file
-containing the MCP server's bearer credential. Serve the dashboard and MCP endpoint
+Code, OpenCode, and Antigravity and a request header value for Claude's custom
+connectors, also set `--mcp-token-file` to a private file containing the MCP server's
+bearer credential. Serve the dashboard and MCP endpoint
 from the same HTTPS origin so the dashboard can authorize clipboard requests. Copy
 configurations only into private client settings because they grant vault access.
 ChatGPT custom apps require a compatible OAuth issuer for this protected endpoint.
