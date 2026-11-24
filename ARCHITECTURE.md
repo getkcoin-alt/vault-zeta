@@ -47,7 +47,9 @@ The library does not decide which event types an application is allowed to emit.
 
 A snapshot is the compact state needed to resume a mission.
 
-Snapshots use monotonically increasing revisions. A caller can provide `expected_revision` when saving so two workers do not silently overwrite one another.
+Snapshot saves check the current revision inside a SQLite write transaction. MCP agents can create a mission snapshot directly. To update it, call `mission_load` and pass its revision as `expected_revision` to `mission_save`. On a `revision_conflict`, reload the snapshot and reconcile the changes before retrying.
+
+Bundle restore preserves imported revisions and only replaces a snapshot if the import's revision is higher than the revision in the vault at the time of the write.
 
 The event log and snapshot serve different purposes:
 
