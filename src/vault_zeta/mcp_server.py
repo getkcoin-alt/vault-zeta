@@ -43,8 +43,10 @@ Run:
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -71,8 +73,65 @@ except ImportError:
             file=sys.stderr,
         )
         sys.exit(1)
+    MCP_V2 = False
+else:
+    MCP_V2 = True
+
+from starlette.applications import Starlette  # noqa: E402
+from starlette.datastructures import Headers  # noqa: E402
+from starlette.responses import PlainTextResponse  # noqa: E402
+from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
 
 DB_PATH = os.environ.get("VAULT_ZETA_DB", os.path.expanduser("~/.vault-zeta/memory.db"))
+HTTP_TOKEN_ENV = "VAULT_ZETA_HTTP_TOKEN"
+HTTP_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~+/-]{32,}=*")
+
+
+class _BearerTokenAuth:
+    def __init__(self, app: ASGIApp, *, token: bytes) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            authorization = Headers(scope=scope).getlist("authorization")
+            if len(authorization) == 1:
+                scheme, _, supplied = authorization[0].partition(" ")
+                if scheme.lower() == "bearer" and hmac.compare_digest(
+                    supplied.lstrip(" ").encode("latin-1"), self.token
+                ):
+                    await self.app(scope, receive, send)
+                    return
+
+            response = PlainTextResponse(
+                "Authentication required",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="vault-zeta"'},
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+class _VaultMCP(FastMCP):
+    def __init__(self, name: str, *, instructions: str, http_token: str | None) -> None:
+        super().__init__(name, instructions=instructions)
+        if http_token is not None and not HTTP_TOKEN_PATTERN.fullmatch(http_token):
+            raise ValueError(f"{HTTP_TOKEN_ENV} must be a bearer token of at least 32 characters")
+        self._http_token = http_token.encode("ascii") if http_token is not None else None
+
+    def _protect_http(self, app: Starlette) -> Starlette:
+        if self._http_token is None:
+            raise ValueError(f"MCP HTTP requires {HTTP_TOKEN_ENV} or an explicit http_token")
+        app.add_middleware(_BearerTokenAuth, token=self._http_token)
+        return app
+
+    def streamable_http_app(self, *args: Any, **kwargs: Any) -> Starlette:
+        return self._protect_http(super().streamable_http_app(*args, **kwargs))
+
+    def sse_app(self, *args: Any, **kwargs: Any) -> Starlette:
+        return self._protect_http(super().sse_app(*args, **kwargs))
 
 
 def _fmt(data: Any) -> str:
@@ -112,9 +171,10 @@ def _task_dict(t) -> dict:
     }
 
 
-def create_server(db_path: str = DB_PATH) -> FastMCP:
-    server = FastMCP(
+def create_server(db_path: str = DB_PATH, *, http_token: str | None = None) -> FastMCP:
+    server = _VaultMCP(
         "vault-zeta",
+        http_token=http_token,
         instructions=(
             "Vault Zeta provides sovereign, persistent long-term memory and mission continuity. "
             "Use memory_save to persist durable facts, user preferences, instructions, and insights. "
@@ -647,13 +707,24 @@ def main():
     )
     args = parser.parse_args()
 
-    server = create_server()
     if args.transport == "stdio":
-        server.run(transport="stdio")
-    elif args.transport == "sse":
-        server.run(transport="sse", host=args.host, port=args.port)
-    elif args.transport == "streamable-http":
-        server.run(transport="streamable-http", host=args.host, port=args.port)
+        create_server().run(transport="stdio")
+        return
+
+    http_token = os.environ.get(HTTP_TOKEN_ENV)
+    if http_token is None:
+        parser.error(f"MCP HTTP requires {HTTP_TOKEN_ENV}")
+    try:
+        server = create_server(http_token=http_token)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if MCP_V2:
+        server.run(transport=args.transport, host=args.host, port=args.port)
+    else:
+        server.settings.host = args.host
+        server.settings.port = args.port
+        server.run(transport=args.transport)
 
 
 if __name__ == "__main__":

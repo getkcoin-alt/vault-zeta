@@ -149,6 +149,18 @@ Or configure in `opencode.json`:
 }
 ```
 
+### Authenticated HTTP transport
+
+Streamable HTTP and SSE require a private `VAULT_ZETA_HTTP_TOKEN` at startup. Generate a
+random credential with at least 32 bytes of entropy, for example with Python's
+`secrets.token_urlsafe(32)`, and supply it through your secret manager or process
+environment. Configure the client to send `Authorization: Bearer <token>` on every
+request. Use TLS for connections outside loopback. Stdio needs no HTTP credential.
+
+The bearer credential grants access to the whole vault. Share it only with agents trusted
+to read and modify that vault, and restart the server after rotating it. Clients must
+support explicit bearer headers. This setup does not provide OAuth discovery or login.
+
 ### Available MCP Tools:
 
 | Tool | Purpose |

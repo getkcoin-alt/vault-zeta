@@ -14,8 +14,8 @@ Do not include real API keys, unrelated private data or customer datasets.
 
 - the SQLite database is **not encrypted by Vault Zeta**
 - callers are responsible for filesystem permissions and disk encryption
-- there is no network server in the current package
-- no authorization system is included
+- MCP defaults to local stdio. Streamable HTTP and SSE require a configured bearer credential
+- the bearer credential grants access to the whole vault. Use TLS for non-loopback connections
 - metadata can itself be sensitive
 - memory retrieval is not a truth guarantee
 - source fingerprints help detect staleness but do not prove a source is trustworthy
