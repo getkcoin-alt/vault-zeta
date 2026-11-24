@@ -257,6 +257,63 @@ CLIENTS = {
     ),
 }
 
+PROMPT_STEPS = {
+    "claude": (
+        "In Claude Code, add or update the user-scope HTTP MCP entry using "
+        "`claude mcp add-json --scope user` or the installed version's MCP settings. "
+        "Use an Authorization value of `Bearer ${VAULT_ZETA_MCP_TOKEN}` and make the variable "
+        "available to the Claude Code process from a private launcher or secret store. "
+        "Check `claude mcp get vault-zeta` or the /mcp menu after reopening Claude Code."
+    ),
+    "opencode": (
+        "In OpenCode, update the active user config using the installed version's schema. "
+        "Use `mcp.servers.vault-zeta` on current versions or `mcp.vault-zeta` on older versions. "
+        "Set type to remote, url to the endpoint above, and oauth to false. "
+        "Use `Bearer {file:PATH}` with the resolved private token path or "
+        "`Bearer {env:VAULT_ZETA_MCP_TOKEN}` in headers.Authorization. "
+        "Check `opencode mcp list` after reopening."
+    ),
+    "antigravity": (
+        "In Antigravity, open MCP Servers → Manage MCP Servers → View raw config to identify the active "
+        "mcp_config.json. Add or merge mcpServers.vault-zeta with serverUrl and headers.Authorization. "
+        "Use the private user config or the app's secret settings, never a shared project file with an inline token. "
+        "Refresh MCP Servers and check the vault-zeta tool list."
+    ),
+    "claude-web": (
+        "In Claude web or desktop, guide me to Customize → Connectors and add a custom web connector. "
+        "Use the endpoint above, choose No sign in, and add an Authorization request header. "
+        "I will enter the header value using Copy header value from the dashboard directly in the connector settings. "
+        "Enable the connector in the chat and check that its tools load."
+    ),
+    "other": (
+        "Check whether this app supports a custom remote MCP server over Streamable HTTP with a bearer header. "
+        "If it does, add or merge the entry in its MCP settings and reload if needed. "
+        "If it requires OAuth or does not offer custom MCP settings, explain the exact blocker."
+    ),
+}
+
+
+def prompt_button(client: str, url: str) -> str:
+    prompt = (
+        f"Set up Vault Zeta in this app as the MCP server `vault-zeta`. "
+        f"Use Streamable HTTP at {url} with an Authorization: Bearer header.\n\n"
+        f"{PROMPT_STEPS[client]}\n\n"
+        "Preserve other MCP entries. Use the app's secret settings, VAULT_ZETA_MCP_TOKEN, "
+        "or an existing user-only token file at ~/.config/vault-zeta/mcp.token or "
+        "~/.config/opencode/vault-zeta-auth/staging-bearer.token. "
+        "Use any local credential inside a local process without printing it or reading it into the chat. "
+        "If you need a credential, ask me to use Copy bearer token in the Vault Zeta dashboard "
+        "and put it in the app's private secret settings or a user-only local token file. "
+        "Never ask for the token in chat, put it in a shared project file, or include it in your report.\n\n"
+        "Verify through this app that Vault Zeta is connected and the memory_search MCP tool is available. "
+        "Use a read-only check and report the app's observed status. If you cannot change this app's settings "
+        "or verify its connection, tell me which action I need to take and report the connection as unverified."
+    )
+    return (
+        f'<button type="button" data-prompt="{client}">Copy setup prompt</button>'
+        f'<template id="prompt-{client}">{escape(prompt)}</template>'
+    )
+
 
 def client_config(client: str, url: str, token: str) -> dict:
     headers = {"Authorization": f"Bearer {token}"}
@@ -277,13 +334,15 @@ def connect_page(request: Request) -> HTMLResponse:
     configured = request.app.state.mcp_token_file is not None
     cards = "".join(
         f'<section class="panel"><h2>{title}</h2><p class="empty">{steps}</p>'
-        f'<div class="actions"><button type="button" data-client="{client}"'
+        f'<div class="actions">{prompt_button(client, url)}'
+        f'<button type="button" class="secondary" data-client="{client}"'
         f'{" disabled" if not configured else ""}>Copy configuration</button>'
         f'<a href="{docs}">Setup guide</a></div></section>'
         for client, (title, steps, docs) in CLIENTS.items()
     )
     return layout("Connect", "connect", (
-        '<h1>Connect an app</h1><p class="lead">Give an AI app access to this vault using Streamable HTTP.</p>'
+        '<h1>Connect an app</h1><p class="lead">Copy the setup prompt for your app and paste it into its chat. '
+        'If the app needs a token, enter it in private settings.</p>'
         f'<section class="panel endpoint"><h2>MCP server URL</h2><code id="mcp-url">{escape(url)}</code>'
         '<div class="actions"><button type="button" data-copy-url>Copy URL</button>'
         f'<button type="button" class="secondary" data-client="token"{" disabled" if not configured else ""}>'
@@ -296,14 +355,18 @@ def connect_page(request: Request) -> HTMLResponse:
         '<section class="panel"><h2>Claude web and desktop</h2>'
         '<p class="empty">In Customize → Connectors, add a custom web connector using the URL above. '
         'Select No sign in, then add an Authorization request header with the copied value.</p>'
-        '<div class="actions"><button type="button" data-client="header"'
+        f'<div class="actions">{prompt_button("claude-web", url)}'
+        '<button type="button" class="secondary" data-client="header"'
         f'{" disabled" if not configured else ""}>Copy header value</button>'
         '<a href="https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp">'
         'Setup guide</a></div></section>'
         '<section class="panel"><h2>ChatGPT</h2>'
         '<p class="empty">Connecting this private vault in ChatGPT requires MCP OAuth. OAuth setup is pending.</p>'
         '<div class="actions"><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt">'
-        'ChatGPT setup guide</a></div></section></div>'
+        'ChatGPT setup guide</a></div></section>'
+        '<section class="panel"><h2>Other MCP clients</h2>'
+        '<p class="empty">Use this prompt with an app that supports remote MCP and bearer headers.</p>'
+        f'<div class="actions">{prompt_button("other", url)}</div></section></div>'
         '<dialog id="copy-dialog"><form method="dialog"><h2>Copy manually</h2>'
         '<label>Connection details<textarea id="copy-text" rows="8" readonly></textarea></label>'
         '<div class="actions"><button>Done</button></div></form></dialog>'

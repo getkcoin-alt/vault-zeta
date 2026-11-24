@@ -1,5 +1,7 @@
 import json
+import re
 import sqlite3
+from html import unescape
 
 import pytest
 from starlette.testclient import TestClient
@@ -81,6 +83,18 @@ def test_connect_only_returns_credentials_to_the_owner_on_an_explicit_same_origi
             assert page.status_code == 200
             assert all(label in page.text for label in (mcp_url, "Claude Code", "OpenCode", "Antigravity", "ChatGPT"))
             assert token not in page.text
+            prompts = dict(re.findall(r'<template id="prompt-([^"]+)">(.*?)</template>', page.text, re.DOTALL))
+            assert set(prompts) == {"claude", "opencode", "antigravity", "claude-web", "other"}
+            assert set(re.findall(r'data-prompt="([^"]+)"', page.text)) == set(prompts)
+            for prompt in prompts.values():
+                assert mcp_url in prompt
+                assert "memory_search" in prompt
+                assert "Never ask for the token in chat" in prompt
+            assert "claude mcp get vault-zeta" in prompts["claude"]
+            assert "{file:PATH}" in prompts["opencode"] and "mcp.servers.vault-zeta" in prompts["opencode"]
+            assert "serverUrl" in prompts["antigravity"]
+            assert "Copy header value" in unescape(prompts["claude-web"])
+            assert "requires OAuth" in prompts["other"]
             assert client.get(copy_route).status_code == 405
             assert "javascript" in client.get("/dashboard/connect.js").headers["content-type"]
             assert client.post(copy_route, json={"client": "token"}).status_code == 403

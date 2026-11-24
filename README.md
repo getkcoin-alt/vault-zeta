@@ -180,6 +180,10 @@ connectors, also set `--mcp-token-file` to a private file containing the MCP ser
 bearer credential. Serve the dashboard and MCP endpoint
 from the same HTTPS origin so the dashboard can authorize clipboard requests. Copy
 configurations only into private client settings because they grant vault access.
+Use **Copy setup prompt** to ask a coding agent to configure the connection and
+verify that it can discover Vault Zeta tools. The prompt includes the endpoint and
+client-specific steps. Provide authentication through the client's private settings,
+an environment variable, or a user-only token file.
 ChatGPT custom apps require a compatible OAuth issuer for this protected endpoint.
 
 ### Available MCP Tools:
