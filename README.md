@@ -161,6 +161,18 @@ The bearer credential grants access to the whole vault. Share it only with agent
 to read and modify that vault, and restart the server after rotating it. Clients must
 support explicit bearer headers. This setup does not provide OAuth discovery or login.
 
+### Read-only owner dashboard
+
+The dashboard browses the existing SQLite vault through a read-only connection. It
+shows memory search and correction history alongside mission snapshots, tasks, and
+events. It uses a dedicated owner password and runs on loopback. For remote access,
+serve `/dashboard/` through your HTTPS reverse proxy and use a private password file.
+
+```bash
+python -m vault_zeta.dashboard --db /path/to/vault.db \
+  --username owner --password-file /path/to/private-dashboard-password
+```
+
 ### Available MCP Tools:
 
 | Tool | Purpose |
