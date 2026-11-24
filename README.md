@@ -173,6 +173,14 @@ python -m vault_zeta.dashboard --db /path/to/vault.db \
   --username owner --password-file /path/to/private-dashboard-password
 ```
 
+Set `--mcp-url https://vault.example.com/mcp` to show the hosted endpoint on the
+dashboard’s Connect page. To enable copying authenticated configurations for Claude
+Code, OpenCode, and Antigravity, also set `--mcp-token-file` to a private file
+containing the MCP server's bearer credential. Serve the dashboard and MCP endpoint
+from the same HTTPS origin so the dashboard can authorize clipboard requests. Copy
+configurations only into private client settings because they grant vault access.
+ChatGPT custom apps require a compatible OAuth issuer for this protected endpoint.
+
 ### Available MCP Tools:
 
 | Tool | Purpose |

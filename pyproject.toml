@@ -22,7 +22,7 @@ vault-zeta-mcp = "vault_zeta.mcp_server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vault_zeta = ["dashboard.css"]
+vault_zeta = ["dashboard.css", "connect.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

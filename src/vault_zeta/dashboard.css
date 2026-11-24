@@ -52,6 +52,15 @@ dd { margin: 0; overflow-wrap: anywhere }
 label { display: grid; gap: .3rem; color: var(--muted); font-size: .91rem }
 input:not([type=checkbox]), button { min-height: 2.65rem; width: 100%; padding: .48rem .68rem; border: 1px solid var(--edge); border-radius: .4rem; background: var(--surface); color: var(--ink); font: inherit }
 button { width: auto; cursor: pointer; background: var(--accent); color: #182316; border-color: transparent; font-weight: 730 }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; margin-top: .9rem }
+button.secondary { background: transparent; color: var(--accent); border-color: var(--edge) }
+button:disabled { opacity: .55; cursor: default }
+.endpoint code { display: block; margin-top: .6rem; overflow-wrap: anywhere }
+.copy-status { min-height: 1.3rem; margin-block: .5rem; color: var(--accent) }
+dialog { width: min(40rem, calc(100% - 2rem)); padding: 1.4rem; color: var(--ink); background: var(--surface); border: 1px solid var(--edge); border-radius: .7rem }
+dialog::backdrop { background: #000a }
+dialog label { margin-top: .7rem }
+textarea { width: 100%; padding: .6rem; border: 1px solid var(--edge); border-radius: .4rem; background: var(--bg); color: var(--ink) }
 .check { display: flex; align-items: center; align-self: center; padding-top: 1.35rem; gap: .4rem }
 .check input { accent-color: var(--accent) }
 .back { display: inline-block; margin-bottom: .85rem }
