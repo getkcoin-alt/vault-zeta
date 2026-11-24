@@ -9,13 +9,13 @@ import json
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -26,7 +26,8 @@ BASE = "/dashboard"
 PAGE_LIMIT = 50
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'none'; style-src 'self'; form-action 'self'; "
+    "Content-Security-Policy": "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; "
+    "form-action 'self'; "
     "base-uri 'none'; frame-ancestors 'none'",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -65,12 +66,13 @@ def layout(title: str, active: str, content: str, *, status: int = 200) -> HTMLR
     current_page = ' aria-current="page"'
     navigation = "".join(
         f'<a href="{link(route)}"{current_page if route == active else ""}>{label}</a>'
-        for route, label in (("", "Overview"), ("memories", "Memories"), ("missions", "Missions"))
+        for route, label in (("", "Overview"), ("memories", "Memories"), ("missions", "Missions"), ("connect", "Connect"))
     )
     return HTMLResponse(
         f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
         f'<meta name="viewport" content="width=device-width,initial-scale=1">'
         f'<title>{escape(title)} · Vault Zeta</title><link rel="stylesheet" href="{link("dashboard.css")}">'
+        f'<script src="{link("connect.js")}" defer></script>'
         f'</head><body><a class="skip" href="#content">Skip to content</a><header class="top">'
         f'<div class="shell top-inner"><a class="brand" href="{link("")}"><span aria-hidden="true">Z</span>'
         f'Vault Zeta</a><nav aria-label="Vault navigation">{navigation}</nav><span class="badge">Read-only</span>'
@@ -237,9 +239,120 @@ def mission_detail(request: Request) -> HTMLResponse:
     ))
 
 
-def create_dashboard(path: str | Path, *, username: str, password: str) -> Starlette:
+CLIENTS = {
+    "claude": (
+        "Claude Code",
+        "Merge into a private .mcp.json, then check the connection with /mcp in Claude Code.",
+        "https://code.claude.com/docs/en/mcp",
+    ),
+    "opencode": (
+        "OpenCode",
+        "Merge this entry into your OpenCode configuration. Check the connection with opencode mcp list.",
+        "https://opencode.ai/docs/mcp-servers",
+    ),
+    "antigravity": (
+        "Antigravity",
+        "In Antigravity, open MCP Servers → Manage MCP Servers → View raw config and merge this entry.",
+        "https://antigravity.google/docs/mcp",
+    ),
+}
+
+
+def client_config(client: str, url: str, token: str) -> dict:
+    headers = {"Authorization": f"Bearer {token}"}
+    if client == "opencode":
+        entry = {"type": "remote", "url": url, "oauth": False, "headers": headers}
+        return {"mcp": {"servers": {"vault-zeta": entry}}}
+    if client == "antigravity":
+        return {"mcpServers": {"vault-zeta": {"serverUrl": url, "headers": headers}}}
+    if client == "claude":
+        return {"mcpServers": {"vault-zeta": {"type": "http", "url": url, "headers": headers}}}
+    raise ValueError("Unknown MCP client")
+
+
+def connect_page(request: Request) -> HTMLResponse:
+    url = request.app.state.mcp_url
+    if not url:
+        return layout("Connect", "connect", '<h1>Connect</h1><p>The hosted MCP URL is not configured.</p>')
+    configured = request.app.state.mcp_token_file is not None
+    cards = "".join(
+        f'<section class="panel"><h2>{title}</h2><p class="empty">{steps}</p>'
+        f'<div class="actions"><button type="button" data-client="{client}"'
+        f'{" disabled" if not configured else ""}>Copy configuration</button>'
+        f'<a href="{docs}">Setup guide</a></div></section>'
+        for client, (title, steps, docs) in CLIENTS.items()
+    )
+    return layout("Connect", "connect", (
+        '<h1>Connect an app</h1><p class="lead">Give an AI app access to this vault using Streamable HTTP.</p>'
+        f'<section class="panel endpoint"><h2>MCP server URL</h2><code id="mcp-url">{escape(url)}</code>'
+        '<div class="actions"><button type="button" data-copy-url>Copy URL</button>'
+        f'<button type="button" class="secondary" data-client="token"{" disabled" if not configured else ""}>'
+        'Copy bearer token</button></div>'
+        '<p class="empty">For other apps, use this URL with Streamable HTTP and a Bearer authorization header. '
+        'The token grants access to the whole vault. Keep copied configurations private.</p>'
+        + ('' if configured else '<p>The dashboard has no configured MCP credential.</p>')
+        + '</section><p role="status" id="copy-status" class="copy-status"></p>'
+        + f'<div class="panels">{cards}'
+        '<section class="panel"><h2>Claude web and desktop</h2>'
+        '<p class="empty">In Customize → Connectors, add a custom web connector using the URL above. '
+        'Select No sign in, then add an Authorization request header with the copied value.</p>'
+        '<div class="actions"><button type="button" data-client="header"'
+        f'{" disabled" if not configured else ""}>Copy header value</button>'
+        '<a href="https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp">'
+        'Setup guide</a></div></section>'
+        '<section class="panel"><h2>ChatGPT</h2>'
+        '<p class="empty">Connecting this private vault in ChatGPT requires MCP OAuth. OAuth setup is pending.</p>'
+        '<div class="actions"><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt">'
+        'ChatGPT setup guide</a></div></section></div>'
+        '<dialog id="copy-dialog"><form method="dialog"><h2>Copy manually</h2>'
+        '<label>Connection details<textarea id="copy-text" rows="8" readonly></textarea></label>'
+        '<div class="actions"><button>Done</button></div></form></dialog>'
+    ))
+
+
+async def connect_copy(request: Request) -> JSONResponse:
+    url = request.app.state.mcp_url
+    token_file = request.app.state.mcp_token_file
+    if not url or token_file is None:
+        raise HTTPException(503, "MCP credential is not configured")
+    parsed = urlsplit(url)
+    if request.headers.get("origin") != f"{parsed.scheme}://{parsed.netloc}":
+        raise HTTPException(403, "Copy must originate from the dashboard")
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
+        raise HTTPException(415, "Copy requires JSON")
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid copy request") from exc
+    client = payload.get("client") if isinstance(payload, dict) else None
+    if not isinstance(client, str) or (client not in ("token", "header") and client not in CLIENTS):
+        raise HTTPException(400, "Unknown MCP client")
+    try:
+        token = token_file.read_text().strip()
+        if not token:
+            raise OSError("Empty credential")
+    except OSError as exc:
+        raise HTTPException(503, "MCP credential is unavailable") from exc
+    if client == "token":
+        value = token
+    elif client == "header":
+        value = f"Bearer {token}"
+    else:
+        value = json.dumps(client_config(client, url, token), indent=2)
+    return JSONResponse({"text": value}, headers=SECURITY_HEADERS)
+
+
+def create_dashboard(
+    path: str | Path, *, username: str, password: str, mcp_url: str | None = None,
+    mcp_token_file: Path | None = None,
+) -> Starlette:
     if not username or ":" in username or len(password) < 24:
         raise ValueError("Configure an owner username and a dashboard password of at least 24 characters")
+    if mcp_url is not None:
+        parsed_url = urlsplit(mcp_url)
+        if (parsed_url.scheme != "https" or not parsed_url.hostname or parsed_url.username is not None
+                or parsed_url.query or parsed_url.fragment):
+            raise ValueError("Configure a public HTTPS MCP URL without user information or query parameters")
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -253,19 +366,24 @@ def create_dashboard(path: str | Path, *, username: str, password: str) -> Starl
     async def redirect(request: Request) -> RedirectResponse:
         return RedirectResponse(link(""), headers=SECURITY_HEADERS)
 
-    def stylesheet(request: Request) -> Response:
-        return Response(Path(__file__).with_name("dashboard.css").read_bytes(),
-                        media_type="text/css", headers=SECURITY_HEADERS)
+    def static_asset(request: Request) -> Response:
+        name = request.url.path.rsplit("/", 1)[-1]
+        media_type = "text/css" if name.endswith(".css") else "text/javascript"
+        return Response(Path(__file__).with_name(name).read_bytes(), media_type=media_type, headers=SECURITY_HEADERS)
 
     app = Starlette(
         routes=[
             Route(BASE, redirect), Route(link(""), overview), Route(link("memories"), memories),
             Route(link("memory"), memory_detail), Route(link("missions"), missions),
-            Route(link("mission"), mission_detail), Route(link("dashboard.css"), stylesheet),
+            Route(link("mission"), mission_detail), Route(link("dashboard.css"), static_asset),
+            Route(link("connect.js"), static_asset), Route(link("connect"), connect_page),
+            Route(link("connect/copy"), connect_copy, methods=["POST"]),
         ],
         lifespan=lifespan,
         exception_handlers={HTTPException: error},
     )
+    app.state.mcp_url = mcp_url
+    app.state.mcp_token_file = mcp_token_file
     app.add_middleware(OwnerAccess, credential=base64.b64encode(f"{username}:{password}".encode()))
     return app
 
@@ -277,9 +395,14 @@ def main() -> None:
     parser.add_argument("--db", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--password-file", type=Path, required=True)
+    parser.add_argument("--mcp-url")
+    parser.add_argument("--mcp-token-file", type=Path)
     parser.add_argument("--port", type=int, default=14873)
     args = parser.parse_args()
-    app = create_dashboard(args.db, username=args.username, password=args.password_file.read_text().strip())
+    app = create_dashboard(
+        args.db, username=args.username, password=args.password_file.read_text().strip(),
+        mcp_url=args.mcp_url, mcp_token_file=args.mcp_token_file,
+    )
     uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
 
 
