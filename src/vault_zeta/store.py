@@ -46,11 +46,16 @@ class VaultZetaStore:
         "blocked",
     }
 
-    def __init__(self, path: str | Path = "vault_zeta.db") -> None:
+    def __init__(self, path: str | Path = "vault_zeta.db", *, read_only: bool = False) -> None:
         self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         with self._lock:
+            if read_only:
+                self.db = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, check_same_thread=False)
+                self.db.row_factory = sqlite3.Row
+                self.db.execute("PRAGMA query_only = ON")
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self.db = sqlite3.connect(self.path, check_same_thread=False)
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA foreign_keys = ON")
