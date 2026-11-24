@@ -20,6 +20,12 @@ if (copyStatus && dialog && fallback) {
   document.querySelector("[data-copy-url]").addEventListener("click", () => {
     copyText(document.querySelector("#mcp-url").textContent, "MCP URL");
   });
+  for (const button of document.querySelectorAll("[data-prompt]")) {
+    button.addEventListener("click", () => {
+      const prompt = document.getElementById("prompt-" + button.dataset.prompt);
+      copyText(prompt.content.textContent, "Setup prompt");
+    });
+  }
   for (const button of document.querySelectorAll("[data-client]")) {
     button.addEventListener("click", async () => {
       button.disabled = true;
