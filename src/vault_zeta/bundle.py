@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .models import EventRecord, MissionSnapshot
 from .redact import assert_clean, assert_clean_structure
+from .store import RevisionConflict
 
 PROTOCOL_VERSION = "1.2.0"
 
@@ -503,23 +504,20 @@ def import_bundle(store, input_dir: str | Path) -> dict[str, int]:
                 if not line:
                     continue
                 d = json.loads(line)
-                mid = d["mission_id"]
-                current = store.load_mission(mid)
-                imported_rev = int(d.get("revision", 1))
-
-                if current is not None and current.revision >= imported_rev:
+                try:
+                    store.save_mission(
+                        mission_id=d["mission_id"],
+                        status=d["status"],
+                        snapshot=d["snapshot"],
+                        forced_revision=int(d.get("revision", 1)),
+                        updated_at=d.get("updated_at"),
+                        reject_secrets=True,
+                        only_if_newer=True,
+                    )
+                except RevisionConflict:
                     snapshots_skipped += 1
-                    continue
-
-                store.save_mission(
-                    mission_id=mid,
-                    status=d["status"],
-                    snapshot=d["snapshot"],
-                    forced_revision=imported_rev,
-                    updated_at=d.get("updated_at"),
-                    reject_secrets=True,
-                )
-                snapshots_added += 1
+                else:
+                    snapshots_added += 1
 
     return {
         "memories_added": memories_added,

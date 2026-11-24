@@ -24,7 +24,7 @@ from .redact import assert_clean, assert_clean_structure
 
 
 class RevisionConflict(RuntimeError):
-    """Raised when a caller tries to overwrite a newer mission snapshot."""
+    """Raised when a snapshot does not meet the writer's revision constraint."""
 
 
 class VaultZetaStore:
@@ -1110,17 +1110,30 @@ class VaultZetaStore:
         forced_revision: int | None = None,
         updated_at: str | None = None,
         reject_secrets: bool = True,
+        create_only: bool = False,
+        only_if_newer: bool = False,
     ) -> int:
+        """Save a snapshot after checking its revision in the write transaction.
+
+        A caller can require a new mission with create_only. A restore can supply
+        forced_revision and only_if_newer to skip an equal or newer snapshot.
+        """
         mission_id = mission_id.strip()
         status = status.strip()
         if not mission_id or not status:
             raise ValueError("mission_id and status must not be empty")
+        if only_if_newer and forced_revision is None:
+            raise ValueError("only_if_newer requires a forced_revision")
 
         if reject_secrets and snapshot:
             assert_clean_structure(snapshot, f"mission snapshot ({mission_id})")
 
         snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
         with self._lock, self.db:
+            # Reserve SQLite's write lock before reading the revision. The Python
+            # lock only coordinates callers sharing this store instance.
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
             existing = self.db.execute(
                 "SELECT revision FROM mission_snapshots WHERE mission_id = ?",
                 (mission_id,),
@@ -1131,54 +1144,38 @@ class VaultZetaStore:
                     raise RevisionConflict(
                         f"mission {mission_id!r} does not exist; expected revision {expected_revision}"
                     )
-                revision = forced_revision if forced_revision is not None else 1
-                if updated_at:
-                    self.db.execute(
-                        """
-                        INSERT INTO mission_snapshots(
-                            mission_id, status, snapshot_json, revision, updated_at
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (mission_id, status, snapshot_json, revision, updated_at),
-                    )
-                else:
-                    self.db.execute(
-                        """
-                        INSERT INTO mission_snapshots(
-                            mission_id, status, snapshot_json, revision
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        (mission_id, status, snapshot_json, revision),
-                    )
-                return revision
-
-            current = int(existing["revision"])
-            if expected_revision is not None and current != expected_revision:
-                raise RevisionConflict(
-                    f"mission {mission_id!r} is revision {current}, not {expected_revision}"
-                )
-
-            revision = forced_revision if forced_revision is not None else (current + 1)
-            if updated_at:
-                self.db.execute(
-                    """
-                    UPDATE mission_snapshots
-                    SET status = ?, snapshot_json = ?, revision = ?,
-                        updated_at = ?
-                    WHERE mission_id = ?
-                    """,
-                    (status, snapshot_json, revision, updated_at, mission_id),
-                )
+                revision = 1
             else:
-                self.db.execute(
-                    """
-                    UPDATE mission_snapshots
-                    SET status = ?, snapshot_json = ?, revision = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE mission_id = ?
-                    """,
-                    (status, snapshot_json, revision, mission_id),
-                )
+                current = int(existing["revision"])
+                if create_only:
+                    raise RevisionConflict(
+                        f"mission {mission_id!r} already exists at revision {current}; "
+                        "load it and provide expected_revision to update it"
+                    )
+                if expected_revision is not None and current != expected_revision:
+                    raise RevisionConflict(
+                        f"mission {mission_id!r} is revision {current}, not {expected_revision}"
+                    )
+                if only_if_newer and forced_revision is not None and forced_revision <= current:
+                    raise RevisionConflict(
+                        f"mission {mission_id!r} is revision {current}; restore revision {forced_revision} is not newer"
+                    )
+                revision = current + 1
+
+            if forced_revision is not None:
+                revision = forced_revision
+            self.db.execute(
+                """
+                INSERT INTO mission_snapshots (mission_id, status, snapshot_json, revision, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(mission_id) DO UPDATE SET
+                    status = excluded.status,
+                    snapshot_json = excluded.snapshot_json,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (mission_id, status, snapshot_json, revision, updated_at or None),
+            )
             return revision
 
     def load_mission(self, mission_id: str) -> MissionSnapshot | None:

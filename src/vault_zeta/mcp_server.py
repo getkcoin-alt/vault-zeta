@@ -57,7 +57,7 @@ _src = _here.parent
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from vault_zeta import SecretInVault, VaultZetaStore  # noqa: E402
+from vault_zeta import RevisionConflict, SecretInVault, VaultZetaStore  # noqa: E402
 
 # Support both mcp 2.x (MCPServer) and mcp 1.x (FastMCP)
 try:
@@ -627,15 +627,18 @@ def create_server(db_path: str = DB_PATH, *, http_token: str | None = None) -> F
         snapshot: dict[str, Any],
         expected_revision: int | None = None,
     ) -> str:
-        """Save or update a mission snapshot — the compact state needed to resume."""
+        """Create a snapshot, or update it using the revision returned by mission_load."""
         try:
             rev = store.save_mission(
                 mission_id,
                 status=status,
                 snapshot=snapshot,
                 expected_revision=expected_revision,
+                create_only=expected_revision is None,
             )
             return _fmt({"saved": True, "mission_id": mission_id, "revision": rev})
+        except RevisionConflict as e:
+            return _fmt({"saved": False, "error": "revision_conflict", "message": str(e)})
         except SecretInVault as e:
             return _fmt({"saved": False, "error": "secret_rejected", "message": str(e)})
         except Exception as e:
